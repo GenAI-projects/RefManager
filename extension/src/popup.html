@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>RefManager</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main>
+    <h1>RefManager</h1>
+    <form id="doi-form">
+      <label for="doi">Add DOI</label>
+      <input id="doi" name="doi" placeholder="10.1038/s41586-020-2649-2" required />
+      <button type="submit">Add</button>
+    </form>
+    <p id="status" aria-live="polite"></p>
+    <button id="open-library" type="button">Open Library Manager</button>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>
