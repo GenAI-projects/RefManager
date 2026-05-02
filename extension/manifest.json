@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "RefManager",
+  "description": "Capture, organize, and insert thesis references by DOI/PMID in Google Docs.",
+  "version": "0.2.0",
+  "permissions": ["storage", "activeTab", "scripting", "identity"],
+  "host_permissions": [
+    "https://docs.google.com/*",
+    "https://api.crossref.org/*",
+    "https://eutils.ncbi.nlm.nih.gov/*",
+    "https://www.googleapis.com/*"
+  ],
+  "oauth2": {
+    "client_id": "REPLACE_WITH_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/drive.appdata"
+    ]
+  },
+  "action": {
+    "default_title": "RefManager",
+    "default_popup": "src/popup.html"
+  },
+  "options_page": "src/options.html",
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://docs.google.com/document/*"],
+      "js": ["src/content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
