@@ -1,46 +1,41 @@
 const DOI_GROUP_PATTERN = /\{([^{}]*10\.\d{4,9}\/[-._;()/:A-Z0-9]+[^{}]*)\}/gi;
+const PMID_GROUP_PATTERN = /\{([^{}]*PMID:\s*\d+[^{}]*)\}/gi;
 
-function parseDoiGroup(rawGroup) {
-  return rawGroup
-    .split(";")
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-function createCitationSpan(dois) {
+function createCitationSpan(label, ids) {
   const span = document.createElement("span");
   span.className = "refmanager-citation";
   span.contentEditable = "false";
-  span.textContent = `[${dois.join(", ")}]`;
-  span.dataset.refmanagerDois = JSON.stringify(dois);
-  span.title = "RefManager citation field";
+  span.textContent = `[${label}: ${ids.join(", ")}]`;
+  span.dataset.refmanager = JSON.stringify({ label, ids });
   return span;
 }
 
-function transformTextNode(node) {
+function replacePatternInText(node, pattern, parser, label) {
   const original = node.nodeValue;
-  if (!original || !DOI_GROUP_PATTERN.test(original)) {
-    DOI_GROUP_PATTERN.lastIndex = 0;
-    return;
+  if (!original || !pattern.test(original)) {
+    pattern.lastIndex = 0;
+    return node;
   }
+  pattern.lastIndex = 0;
 
-  DOI_GROUP_PATTERN.lastIndex = 0;
   const fragment = document.createDocumentFragment();
-  let lastIndex = 0;
+  let last = 0;
   let match;
-
-  while ((match = DOI_GROUP_PATTERN.exec(original)) !== null) {
-    const [fullMatch, group] = match;
-    fragment.appendChild(document.createTextNode(original.slice(lastIndex, match.index)));
-
-    const dois = parseDoiGroup(group);
-    fragment.appendChild(createCitationSpan(dois));
-
-    lastIndex = match.index + fullMatch.length;
+  while ((match = pattern.exec(original)) !== null) {
+    fragment.appendChild(document.createTextNode(original.slice(last, match.index)));
+    fragment.appendChild(createCitationSpan(label, parser(match[1])));
+    last = match.index + match[0].length;
   }
-
-  fragment.appendChild(document.createTextNode(original.slice(lastIndex)));
+  fragment.appendChild(document.createTextNode(original.slice(last)));
   node.parentNode?.replaceChild(fragment, node);
+}
+
+function parseDoiGroup(group) {
+  return group.split(";").map((x) => x.trim()).filter((x) => x && x.includes("/"));
+}
+
+function parsePmidGroup(group) {
+  return group.split(";").map((x) => x.replace(/PMID:\s*/i, "").trim()).filter(Boolean);
 }
 
 function processEditableRoots() {
@@ -49,13 +44,23 @@ function processEditableRoots() {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     const textNodes = [];
     let current;
-    while ((current = walker.nextNode())) {
-      textNodes.push(current);
-    }
-    textNodes.forEach(transformTextNode);
+    while ((current = walker.nextNode())) textNodes.push(current);
+    textNodes.forEach((node) => {
+      replacePatternInText(node, DOI_GROUP_PATTERN, parseDoiGroup, "DOI");
+      replacePatternInText(node, PMID_GROUP_PATTERN, parsePmidGroup, "PMID");
+    });
   });
 }
 
-const observer = new MutationObserver(() => processEditableRoots());
-observer.observe(document.body, { childList: true, subtree: true, characterData: true });
-processEditableRoots();
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.type === "convertDocTokens") {
+    processEditableRoots();
+    sendResponse({ ok: true });
+  }
+});
+
+const button = document.createElement("button");
+button.textContent = "Convert Ref Tokens";
+button.style.cssText = "position:fixed;bottom:12px;right:12px;z-index:99999;padding:8px;";
+button.addEventListener("click", processEditableRoots);
+document.body.appendChild(button);
