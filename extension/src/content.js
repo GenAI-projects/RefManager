@@ -106,7 +106,12 @@ function refreshCitationSpanOrder() {
   editors.forEach((root) => {
     const spans = root.querySelectorAll(".refmanager-citation");
     spans.forEach((span) => {
-      const payload = JSON.parse(span.dataset.refmanager || "{}");
+      let payload = {};
+      try {
+        payload = JSON.parse(span.dataset.refmanager || "{}");
+      } catch (_error) {
+        payload = {};
+      }
       const label = payload.label || "DOI";
       const ids = (payload.ids || []).map((id) => normalizeToken(label === "PMID" ? String(id).replace(/^PMID:/i, "") : id));
       const indices = ids.map((id) => {
@@ -122,17 +127,25 @@ function refreshCitationSpanOrder() {
 }
 
 async function convertDocTokensWithAutoLookup(sendResponse) {
-  const groups = collectTokenGroups();
-  chrome.runtime.sendMessage({ type: "ingestTokensAndBuildCitations", groups, ...getDocContext() }, (response) => {
-    if (!response?.ok) {
-      sendResponse({ ok: false, error: response?.error || "Failed to ingest tokens." });
-      return;
-    }
-    const replacements = new Map(response.replacements.map((r) => [r.key, { display: r.display }]));
-    processEditableRoots(replacements);
-    refreshCitationSpanOrder();
-    sendResponse({ ok: true, imported: response.imported, failed: response.failed });
-  });
+  try {
+    const groups = collectTokenGroups();
+    chrome.runtime.sendMessage({ type: "ingestTokensAndBuildCitations", groups, ...getDocContext() }, (response) => {
+      if (chrome.runtime.lastError) {
+        sendResponse({ ok: false, error: chrome.runtime.lastError.message });
+        return;
+      }
+      if (!response?.ok) {
+        sendResponse({ ok: false, error: response?.error || "Failed to ingest tokens." });
+        return;
+      }
+      const replacements = new Map((response.replacements || []).map((r) => [r.key, { display: r.display }]));
+      processEditableRoots(replacements);
+      refreshCitationSpanOrder();
+      sendResponse({ ok: true, imported: response.imported, failed: response.failed });
+    });
+  } catch (error) {
+    sendResponse({ ok: false, error: error.message || "Token conversion failed." });
+  }
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
