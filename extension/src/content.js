@@ -1,20 +1,31 @@
 const DOI_GROUP_PATTERN = /\{([^{}]*10\.\d{4,9}\/[-._;()/:A-Z0-9]+[^{}]*)\}/gi;
 const PMID_GROUP_PATTERN = /\{([^{}]*PMID:\s*\d+[^{}]*)\}/gi;
 
-function createCitationSpan(label, ids) {
+function normalizeToken(id) {
+  return String(id || "").trim().replace(/\s+/g, "");
+}
+
+function getDocContext() {
+  const match = window.location.pathname.match(/\/document\/d\/([^/]+)/);
+  const docId = match?.[1] || document.title || "default-doc";
+  const cleanTitle = (document.title || "Untitled Doc").replace(/\s+-\s+Google Docs\s*$/i, "").trim();
+  return { docId, docName: cleanTitle || "Untitled Doc" };
+}
+
+function createCitationSpan(label, displayValue, ids) {
   const span = document.createElement("span");
   span.className = "refmanager-citation";
   span.contentEditable = "false";
-  span.textContent = `[${label}: ${ids.join(", ")}]`;
-  span.dataset.refmanager = JSON.stringify({ label, ids });
+  span.textContent = `[${displayValue}]`;
+  span.dataset.refmanager = JSON.stringify({ label, ids, displayValue });
   return span;
 }
 
-function replacePatternInText(node, pattern, parser, label) {
+function replacePatternInText(node, pattern, parser, replacements, label) {
   const original = node.nodeValue;
   if (!original || !pattern.test(original)) {
     pattern.lastIndex = 0;
-    return node;
+    return;
   }
   pattern.lastIndex = 0;
 
@@ -23,7 +34,14 @@ function replacePatternInText(node, pattern, parser, label) {
   let match;
   while ((match = pattern.exec(original)) !== null) {
     fragment.appendChild(document.createTextNode(original.slice(last, match.index)));
-    fragment.appendChild(createCitationSpan(label, parser(match[1])));
+    const parsedIds = parser(match[1]);
+    const normalizedKey = parsedIds.map(normalizeToken).join(";");
+    const replacement = replacements.get(`${label}|${normalizedKey}`);
+    if (replacement) {
+      fragment.appendChild(createCitationSpan(label, replacement.display, parsedIds));
+    } else {
+      fragment.appendChild(document.createTextNode(match[0]));
+    }
     last = match.index + match[0].length;
   }
   fragment.appendChild(document.createTextNode(original.slice(last)));
@@ -35,10 +53,32 @@ function parseDoiGroup(group) {
 }
 
 function parsePmidGroup(group) {
-  return group.split(";").map((x) => x.replace(/PMID:\s*/i, "").trim()).filter(Boolean);
+  return group.split(";").map((x) => x.replace(/PMID:\s*/gi, "").trim()).filter(Boolean);
 }
 
-function processEditableRoots() {
+function collectTokenGroups() {
+  const groups = [];
+  const editors = document.querySelectorAll('[contenteditable="true"]');
+  editors.forEach((root) => {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let current;
+    while ((current = walker.nextNode())) {
+      const text = current.nodeValue || "";
+      DOI_GROUP_PATTERN.lastIndex = 0;
+      PMID_GROUP_PATTERN.lastIndex = 0;
+      let match;
+      while ((match = DOI_GROUP_PATTERN.exec(text)) !== null) {
+        groups.push({ label: "DOI", ids: parseDoiGroup(match[1]) });
+      }
+      while ((match = PMID_GROUP_PATTERN.exec(text)) !== null) {
+        groups.push({ label: "PMID", ids: parsePmidGroup(match[1]) });
+      }
+    }
+  });
+  return groups;
+}
+
+function processEditableRoots(replacements) {
   const editors = document.querySelectorAll('[contenteditable="true"]');
   editors.forEach((root) => {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
@@ -46,21 +86,69 @@ function processEditableRoots() {
     let current;
     while ((current = walker.nextNode())) textNodes.push(current);
     textNodes.forEach((node) => {
-      replacePatternInText(node, DOI_GROUP_PATTERN, parseDoiGroup, "DOI");
-      replacePatternInText(node, PMID_GROUP_PATTERN, parsePmidGroup, "PMID");
+      replacePatternInText(node, DOI_GROUP_PATTERN, parseDoiGroup, replacements, "DOI");
+      replacePatternInText(node, PMID_GROUP_PATTERN, parsePmidGroup, replacements, "PMID");
     });
+  });
+}
+
+function formatCitationField(indices) {
+  const sorted = [...new Set(indices)].sort((a, b) => a - b);
+  if (!sorted.length) return "";
+  if (sorted.length > 3) return `${sorted[0]}-${sorted[sorted.length - 1]}`;
+  return sorted.join(",");
+}
+
+function refreshCitationSpanOrder() {
+  const editors = document.querySelectorAll('[contenteditable="true"]');
+  const refOrder = new Map();
+  let nextIndex = 1;
+  editors.forEach((root) => {
+    const spans = root.querySelectorAll(".refmanager-citation");
+    spans.forEach((span) => {
+      const payload = JSON.parse(span.dataset.refmanager || "{}");
+      const label = payload.label || "DOI";
+      const ids = (payload.ids || []).map((id) => normalizeToken(label === "PMID" ? String(id).replace(/^PMID:/i, "") : id));
+      const indices = ids.map((id) => {
+        const key = `${label}|${id}`;
+        if (!refOrder.has(key)) refOrder.set(key, nextIndex++);
+        return refOrder.get(key);
+      });
+      const displayValue = formatCitationField(indices);
+      span.textContent = `[${displayValue}]`;
+      span.dataset.refmanager = JSON.stringify({ ...payload, ids, displayValue });
+    });
+  });
+}
+
+async function convertDocTokensWithAutoLookup(sendResponse) {
+  const groups = collectTokenGroups();
+  chrome.runtime.sendMessage({ type: "ingestTokensAndBuildCitations", groups, ...getDocContext() }, (response) => {
+    if (!response?.ok) {
+      sendResponse({ ok: false, error: response?.error || "Failed to ingest tokens." });
+      return;
+    }
+    const replacements = new Map(response.replacements.map((r) => [r.key, { display: r.display }]));
+    processEditableRoots(replacements);
+    refreshCitationSpanOrder();
+    sendResponse({ ok: true, imported: response.imported, failed: response.failed });
   });
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === "convertDocTokens") {
-    processEditableRoots();
-    sendResponse({ ok: true });
+    convertDocTokensWithAutoLookup(sendResponse);
+    return true;
   }
+  return false;
 });
 
 const button = document.createElement("button");
 button.textContent = "Convert Ref Tokens";
 button.style.cssText = "position:fixed;bottom:12px;right:12px;z-index:99999;padding:8px;";
-button.addEventListener("click", processEditableRoots);
+button.addEventListener("click", () => {
+  convertDocTokensWithAutoLookup((response) => {
+    console.info("RefManager conversion", response);
+  });
+});
 document.body.appendChild(button);

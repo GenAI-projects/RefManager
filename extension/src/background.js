@@ -2,12 +2,46 @@ const DOI_PATTERN = /^10\.\d{4,9}\/[-._;()/:A-Z0-9]+$/i;
 const PMID_PATTERN = /^\d{1,10}$/;
 
 async function getLibrary() {
-  const { library = [], citationStyle = "apa" } = await chrome.storage.local.get(["library", "citationStyle"]);
-  return { library, citationStyle };
+  const { library = [], citationStyle = "apa", librariesByDoc = {}, activeDocKey = null } = await chrome.storage.local.get(["library", "citationStyle", "librariesByDoc", "activeDocKey"]);
+  return { library, citationStyle, librariesByDoc, activeDocKey };
 }
 
 async function saveLibrary(library) {
   await chrome.storage.local.set({ library });
+}
+
+async function saveLibraryForDoc(docKey, docName, library, librariesByDoc) {
+  const updated = { ...(librariesByDoc || {}) };
+  updated[docKey] = { docName, library, updatedAt: new Date().toISOString() };
+  await chrome.storage.local.set({ library, librariesByDoc: updated, activeDocKey: docKey });
+}
+
+function normalizeIdentifier(value) {
+  return String(value || "").trim().replace(/\s+/g, "");
+}
+
+function formatCitationField(indices) {
+  if (!indices.length) return "";
+  const sorted = [...new Set(indices)].sort((a, b) => a - b);
+  if (sorted.length > 3) return `${sorted[0]}-${sorted[sorted.length - 1]}`;
+  return sorted.join(",");
+}
+
+async function upsertIdentifier(mode, rawValue, currentLibrary) {
+  const raw = normalizeIdentifier(rawValue);
+  if (!raw) return { record: null, library: currentLibrary, imported: false };
+  if (mode === "doi") {
+    if (!DOI_PATTERN.test(raw)) throw new Error(`Invalid DOI format: ${raw}`);
+    const existing = currentLibrary.find((x) => x.doi?.toLowerCase() === raw.toLowerCase());
+    if (existing) return { record: existing, library: currentLibrary, imported: false };
+    const record = await fetchReferenceByDoi(raw);
+    return { record, library: [...currentLibrary, record], imported: true };
+  }
+  if (!PMID_PATTERN.test(raw)) throw new Error(`Invalid PMID format: ${raw}`);
+  const existing = currentLibrary.find((x) => x.pmid === raw);
+  if (existing) return { record: existing, library: currentLibrary, imported: false };
+  const record = await fetchReferenceByPmid(raw);
+  return { record, library: [...currentLibrary, record], imported: true };
 }
 
 function fingerprint(record) {
@@ -54,6 +88,24 @@ async function fetchReferenceByPmid(pmid) {
   };
 }
 
+
+
+function mergeLibraries(localLibrary, sharedLibrary) {
+  const map = new Map();
+  for (const item of [...sharedLibrary, ...localLibrary]) {
+    const key = item.doi?.toLowerCase() || item.pmid || fingerprint(item);
+    const existing = map.get(key);
+    if (!existing) {
+      map.set(key, item);
+      continue;
+    }
+    const existingDate = new Date(existing.addedAt || 0).getTime();
+    const incomingDate = new Date(item.addedAt || 0).getTime();
+    if (incomingDate >= existingDate) map.set(key, { ...existing, ...item });
+  }
+  return [...map.values()];
+}
+
 function formatCitation(record, style) {
   const authors = record.authors || "Unknown";
   if (style === "mla") return `${authors}. \"${record.title}.\" ${record.journal}, ${record.year}.`;
@@ -63,7 +115,7 @@ function formatCitation(record, style) {
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   (async () => {
-    const { library, citationStyle } = await getLibrary();
+    const { library, citationStyle, librariesByDoc } = await getLibrary();
 
     if (message?.type === "addIdentifier") {
       const raw = (message.value ?? "").trim();
@@ -103,6 +155,29 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return;
     }
 
+
+    if (message?.type === "syncLibraryPush") {
+      const payload = {
+        updatedAt: new Date().toISOString(),
+        library,
+        csl: JSON.stringify(library),
+        bib: library.map((r, i) => `@article{ref${i + 1}, title={${r.title || ""}}, author={${r.authors || ""}}, year={${r.year || ""}}, doi={${r.doi || ""}}}`).join("\n\n"),
+        ris: library.map((r) => `TY  - JOUR\nTI  - ${r.title || ""}\nAU  - ${r.authors || ""}\nPY  - ${r.year || ""}\nDO  - ${r.doi || ""}\nER  -`).join("\n\n")
+      };
+      await chrome.storage.sync.set({ sharedLibraryPayload: payload });
+      sendResponse({ ok: true, count: library.length });
+      return;
+    }
+
+    if (message?.type === "syncLibraryPull") {
+      const { sharedLibraryPayload } = await chrome.storage.sync.get(["sharedLibraryPayload"]);
+      const shared = sharedLibraryPayload?.library || [];
+      const merged = mergeLibraries(library, shared);
+      await saveLibrary(merged);
+      sendResponse({ ok: true, count: merged.length, resolved: library.length + shared.length - merged.length });
+      return;
+    }
+
     if (message?.type === "mergeDuplicates") {
       const seen = new Map();
       const merged = [];
@@ -117,6 +192,40 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       sendResponse({ ok: true, removed: library.length - merged.length });
       return;
     }
+    if (message?.type === "ingestTokensAndBuildCitations") {
+      const docKey = message.docId || "default-doc";
+      const docName = message.docName || "Untitled Doc";
+      const scopedLibrary = librariesByDoc?.[docKey]?.library || library;
+      let workingLibrary = [...scopedLibrary];
+      let imported = 0;
+      const failed = [];
+      const replacements = [];
+
+      for (const group of (message.groups || [])) {
+        const mode = (group.label || "").toLowerCase() === "pmid" ? "pmid" : "doi";
+        const ids = (group.ids || []).map((x) => normalizeIdentifier(mode === "pmid" ? String(x).replace(/^PMID:/i, "") : x)).filter(Boolean);
+        const citationIndexes = [];
+
+        for (const id of ids) {
+          try {
+            const result = await upsertIdentifier(mode, id, workingLibrary);
+            workingLibrary = result.library;
+            if (result.imported) imported += 1;
+            if (result.record) citationIndexes.push(workingLibrary.indexOf(result.record) + 1);
+          } catch (error) {
+            failed.push({ id, error: error.message });
+          }
+        }
+
+        const key = `${mode === "pmid" ? "PMID" : "DOI"}|${ids.join(";")}`;
+        replacements.push({ key, display: formatCitationField(citationIndexes) });
+      }
+
+      await saveLibraryForDoc(docKey, docName, workingLibrary, librariesByDoc);
+      sendResponse({ ok: true, replacements, imported, failed, docKey, docName });
+      return;
+    }
+
   })();
 
   return true;

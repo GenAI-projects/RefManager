@@ -27,3 +27,15 @@ document.getElementById("refresh").addEventListener("click", loadLibrary);
 document.getElementById("clear").addEventListener("click", () => chrome.storage.local.set({ library: [] }, loadLibrary));
 document.getElementById("merge").addEventListener("click", () => chrome.runtime.sendMessage({ type: "mergeDuplicates" }, loadLibrary));
 loadLibrary();
+
+
+function setStatus(message) {
+  const el = document.getElementById("sync-status");
+  if (el) el.textContent = message;
+}
+
+document.getElementById("sync-push").addEventListener("click", () => chrome.runtime.sendMessage({ type: "syncLibraryPush" }, (res) => setStatus(res?.ok ? `Shared sync updated (${res.count} records).` : (res?.error || "Push failed"))));
+document.getElementById("sync-pull").addEventListener("click", () => chrome.runtime.sendMessage({ type: "syncLibraryPull" }, (res) => {
+  setStatus(res?.ok ? `Shared sync pulled (${res.count} records, ${res.resolved} conflicts resolved).` : (res?.error || "Pull failed"));
+  loadLibrary();
+}));
