@@ -113,6 +113,54 @@ function formatCitation(record, style) {
   return `${authors} (${record.year}). ${record.title}. ${record.journal}.`;
 }
 
+async function getAuthToken(interactive = false) {
+  const { oauthAccessToken, oauthTokenExpiresAt = 0, oauthClientId = "" } = await chrome.storage.local.get(["oauthAccessToken", "oauthTokenExpiresAt", "oauthClientId"]);
+  if (oauthAccessToken && Date.now() < oauthTokenExpiresAt - 60_000) return oauthAccessToken;
+  if (!interactive) throw new Error("Authentication required.");
+  if (!oauthClientId) throw new Error("Google OAuth Client ID is not configured. Set it on the landing page.");
+
+  const redirectUri = chrome.identity.getRedirectURL("oauth2");
+  const scopes = [
+    "https://www.googleapis.com/auth/drive.appdata",
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive.metadata.readonly",
+    "https://www.googleapis.com/auth/userinfo.email"
+  ].join(" ");
+  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(oauthClientId)}&response_type=token&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scopes)}&prompt=consent`;
+  const finalUrl = await new Promise((resolve, reject) => {
+    chrome.identity.launchWebAuthFlow({ url: authUrl, interactive: true }, (url) => {
+      if (chrome.runtime.lastError || !url) {
+        reject(new Error(chrome.runtime.lastError?.message || "OAuth flow failed."));
+        return;
+      }
+      resolve(url);
+    });
+  });
+  const hash = new URL(finalUrl).hash.replace(/^#/, "");
+  const params = new URLSearchParams(hash);
+  const token = params.get("access_token");
+  const expiresIn = Number(params.get("expires_in") || "3600");
+  if (!token) throw new Error("OAuth token missing from response.");
+  const tokenExpiresAt = Date.now() + expiresIn * 1000;
+  await chrome.storage.local.set({ oauthAccessToken: token, oauthTokenExpiresAt: tokenExpiresAt });
+  return token;
+}
+
+async function googleApi(path, token, method = "GET", body, headers = {}) {
+  const response = await fetch(`https://www.googleapis.com${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      ...headers
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (!response.ok) throw new Error(`Google API ${method} ${path} failed: ${response.status}`);
+  if (response.status === 204) return {};
+  return response.json();
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   (async () => {
     const { library, citationStyle, librariesByDoc } = await getLibrary();
@@ -157,6 +205,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 
     if (message?.type === "syncLibraryPush") {
+      const token = await getAuthToken(true);
       const payload = {
         updatedAt: new Date().toISOString(),
         library,
@@ -165,16 +214,59 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         ris: library.map((r) => `TY  - JOUR\nTI  - ${r.title || ""}\nAU  - ${r.authors || ""}\nPY  - ${r.year || ""}\nDO  - ${r.doi || ""}\nER  -`).join("\n\n")
       };
       await chrome.storage.sync.set({ sharedLibraryPayload: payload });
+      const list = await googleApi("/drive/v3/files?q=name='refmanager-shared-library.json' and trashed=false and 'appDataFolder' in parents&spaces=appDataFolder&fields=files(id,name)", token);
+      const existingId = list?.files?.[0]?.id;
+      if (existingId) {
+        await fetch(`https://www.googleapis.com/upload/drive/v3/files/${existingId}?uploadType=media`, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      } else {
+        const created = await googleApi("/drive/v3/files", token, "POST", { name: "refmanager-shared-library.json", parents: ["appDataFolder"] });
+        await fetch(`https://www.googleapis.com/upload/drive/v3/files/${created.id}?uploadType=media`, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      }
       sendResponse({ ok: true, count: library.length });
       return;
     }
 
     if (message?.type === "syncLibraryPull") {
+      const token = await getAuthToken(true);
+      const list = await googleApi("/drive/v3/files?q=name='refmanager-shared-library.json' and trashed=false and 'appDataFolder' in parents&spaces=appDataFolder&fields=files(id,name)", token);
+      if (list?.files?.[0]?.id) {
+        const drivePayload = await fetch(`https://www.googleapis.com/drive/v3/files/${list.files[0].id}?alt=media`, { headers: { Authorization: `Bearer ${token}` } });
+        if (drivePayload.ok) {
+          const json = await drivePayload.json();
+          await chrome.storage.sync.set({ sharedLibraryPayload: json });
+        }
+      }
       const { sharedLibraryPayload } = await chrome.storage.sync.get(["sharedLibraryPayload"]);
       const shared = sharedLibraryPayload?.library || [];
       const merged = mergeLibraries(library, shared);
       await saveLibrary(merged);
       sendResponse({ ok: true, count: merged.length, resolved: library.length + shared.length - merged.length });
+      return;
+    }
+
+    if (message?.type === "googleLogin") {
+      try {
+        const token = await getAuthToken(true);
+        const profile = await googleApi("/oauth2/v2/userinfo", token);
+        sendResponse({ ok: true, email: profile?.email, scopes: ["drive.appdata", "drive.file", "drive.metadata.readonly", "userinfo.email"] });
+      } catch (error) {
+        sendResponse({ ok: false, error: error.message });
+      }
+      return;
+    }
+
+    if (message?.type === "drivePermissionCheck") {
+      try {
+        const token = await getAuthToken(true);
+        const profile = await googleApi("/oauth2/v2/userinfo", token);
+        const created = await googleApi("/drive/v3/files", token, "POST", { name: `refmanager-permission-check-${Date.now()}.json`, parents: ["appDataFolder"] });
+        await fetch(`https://www.googleapis.com/upload/drive/v3/files/${created.id}?uploadType=media`, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ ping: "ok" }) });
+        await fetch(`https://www.googleapis.com/upload/drive/v3/files/${created.id}?uploadType=media`, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ ping: "edited" }) });
+        await fetch(`https://www.googleapis.com/drive/v3/files/${created.id}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } });
+        sendResponse({ ok: true, email: profile?.email, profileRead: true, writeCheck: true, editCheck: true, deleteCheck: true });
+      } catch (error) {
+        sendResponse({ ok: false, error: error.message });
+      }
       return;
     }
 

@@ -39,6 +39,7 @@ function replacePatternInText(node, pattern, parser, replacements, label) {
     const replacement = replacements.get(`${label}|${normalizedKey}`);
     if (replacement) {
       fragment.appendChild(createCitationSpan(label, replacement.display, parsedIds));
+      replacePatternInText.replacedCount = (replacePatternInText.replacedCount || 0) + 1;
     } else {
       fragment.appendChild(document.createTextNode(match[0]));
     }
@@ -79,6 +80,7 @@ function collectTokenGroups() {
 }
 
 function processEditableRoots(replacements) {
+  replacePatternInText.replacedCount = 0;
   const editors = document.querySelectorAll('[contenteditable="true"]');
   editors.forEach((root) => {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
@@ -90,6 +92,67 @@ function processEditableRoots(replacements) {
       replacePatternInText(node, PMID_GROUP_PATTERN, parsePmidGroup, replacements, "PMID");
     });
   });
+  return replacePatternInText.replacedCount || 0;
+}
+
+function formatCitationField(indices) {
+  const sorted = [...new Set(indices)].sort((a, b) => a - b);
+  if (!sorted.length) return "";
+  if (sorted.length > 3) return `${sorted[0]}-${sorted[sorted.length - 1]}`;
+  return sorted.join(",");
+}
+
+function refreshCitationSpanOrder() {
+  const editors = document.querySelectorAll('[contenteditable="true"]');
+  const refOrder = new Map();
+  let nextIndex = 1;
+  editors.forEach((root) => {
+    const spans = root.querySelectorAll(".refmanager-citation");
+    spans.forEach((span) => {
+      let payload = {};
+      try {
+        payload = JSON.parse(span.dataset.refmanager || "{}");
+      } catch (_error) {
+        payload = {};
+      }
+      const label = payload.label || "DOI";
+      const ids = (payload.ids || []).map((id) => normalizeToken(label === "PMID" ? String(id).replace(/^PMID:/i, "") : id));
+      const indices = ids.map((id) => {
+        const key = `${label}|${id}`;
+        if (!refOrder.has(key)) refOrder.set(key, nextIndex++);
+        return refOrder.get(key);
+      });
+      const displayValue = formatCitationField(indices);
+      span.textContent = `[${displayValue}]`;
+      span.dataset.refmanager = JSON.stringify({ ...payload, ids, displayValue });
+    });
+  });
+}
+
+async function convertDocTokensWithAutoLookup(sendResponse) {
+  try {
+    const groups = collectTokenGroups();
+    chrome.runtime.sendMessage({ type: "ingestTokensAndBuildCitations", groups, ...getDocContext() }, (response) => {
+      if (chrome.runtime.lastError) {
+        sendResponse({ ok: false, error: chrome.runtime.lastError.message });
+        return;
+      }
+      if (!response?.ok) {
+        sendResponse({ ok: false, error: response?.error || "Failed to ingest tokens." });
+        return;
+      }
+      const replacements = new Map((response.replacements || []).map((r) => [r.key, { display: r.display }]));
+      const replacedCount = processEditableRoots(replacements);
+      refreshCitationSpanOrder();
+      if (!replacedCount) {
+        sendResponse({ ok: false, error: "No DOI/PMID token groups were found in editable text nodes to replace." });
+        return;
+      }
+      sendResponse({ ok: true, imported: response.imported, failed: response.failed, replacedCount });
+    });
+  } catch (error) {
+    sendResponse({ ok: false, error: error.message || "Token conversion failed." });
+  }
 }
 
 function formatCitationField(indices) {
