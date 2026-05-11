@@ -119,7 +119,7 @@ async function getAuthToken(interactive = false) {
   if (!interactive) throw new Error("Authentication required.");
   if (!oauthClientId) throw new Error("Google OAuth Client ID is not configured. Set it on the landing page.");
 
-  const redirectUri = chrome.identity.getRedirectURL("oauth2");
+  const redirectUri = chrome.identity.getRedirectURL();
   const scopes = [
     "https://www.googleapis.com/auth/drive.appdata",
     "https://www.googleapis.com/auth/drive.file",

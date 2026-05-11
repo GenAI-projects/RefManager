@@ -1,5 +1,6 @@
 const statusEl = document.getElementById('status');
 const clientIdInput = document.getElementById('client-id');
+document.getElementById('redirect-uri').textContent = chrome.identity.getRedirectURL();
 
 function setStatus(lines) {
   statusEl.textContent = Array.isArray(lines) ? lines.join('\n') : lines;

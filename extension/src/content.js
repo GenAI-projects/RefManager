@@ -155,6 +155,32 @@ async function convertDocTokensWithAutoLookup(sendResponse) {
   }
 }
 
+async function convertDocTokensWithAutoLookup(sendResponse) {
+  try {
+    const groups = collectTokenGroups();
+    chrome.runtime.sendMessage({ type: "ingestTokensAndBuildCitations", groups, ...getDocContext() }, (response) => {
+      if (chrome.runtime.lastError) {
+        sendResponse({ ok: false, error: chrome.runtime.lastError.message });
+        return;
+      }
+      if (!response?.ok) {
+        sendResponse({ ok: false, error: response?.error || "Failed to ingest tokens." });
+        return;
+      }
+      const replacements = new Map((response.replacements || []).map((r) => [r.key, { display: r.display }]));
+      const replacedCount = processEditableRoots(replacements);
+      refreshCitationSpanOrder();
+      if (!replacedCount) {
+        sendResponse({ ok: false, error: "No DOI/PMID token groups were found in editable text nodes to replace." });
+        return;
+      }
+      sendResponse({ ok: true, imported: response.imported, failed: response.failed, replacedCount });
+    });
+  } catch (error) {
+    sendResponse({ ok: false, error: error.message || "Token conversion failed." });
+  }
+}
+
 function formatCitationField(indices) {
   const sorted = [...new Set(indices)].sort((a, b) => a - b);
   if (!sorted.length) return "";
