@@ -1,8 +1,18 @@
 const statusEl = document.getElementById('status');
+const clientIdInput = document.getElementById('client-id');
 
 function setStatus(lines) {
   statusEl.textContent = Array.isArray(lines) ? lines.join('\n') : lines;
 }
+
+chrome.storage.local.get(["oauthClientId"], ({ oauthClientId }) => {
+  clientIdInput.value = oauthClientId || "";
+});
+
+document.getElementById('save-client').addEventListener('click', () => {
+  const oauthClientId = clientIdInput.value.trim();
+  chrome.storage.local.set({ oauthClientId }, () => setStatus(oauthClientId ? "Client ID saved." : "Client ID cleared."));
+});
 
 document.getElementById('login').addEventListener('click', () => {
   chrome.runtime.sendMessage({ type: 'googleLogin' }, (res) => {

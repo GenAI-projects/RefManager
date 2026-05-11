@@ -113,16 +113,37 @@ function formatCitation(record, style) {
   return `${authors} (${record.year}). ${record.title}. ${record.journal}.`;
 }
 
-function getAuthToken(interactive = false) {
-  return new Promise((resolve, reject) => {
-    chrome.identity.getAuthToken({ interactive }, (token) => {
-      if (chrome.runtime.lastError || !token) {
-        reject(new Error(chrome.runtime.lastError?.message || "Unable to acquire auth token."));
+async function getAuthToken(interactive = false) {
+  const { oauthAccessToken, oauthTokenExpiresAt = 0, oauthClientId = "" } = await chrome.storage.local.get(["oauthAccessToken", "oauthTokenExpiresAt", "oauthClientId"]);
+  if (oauthAccessToken && Date.now() < oauthTokenExpiresAt - 60_000) return oauthAccessToken;
+  if (!interactive) throw new Error("Authentication required.");
+  if (!oauthClientId) throw new Error("Google OAuth Client ID is not configured. Set it on the landing page.");
+
+  const redirectUri = chrome.identity.getRedirectURL("oauth2");
+  const scopes = [
+    "https://www.googleapis.com/auth/drive.appdata",
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive.metadata.readonly",
+    "https://www.googleapis.com/auth/userinfo.email"
+  ].join(" ");
+  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(oauthClientId)}&response_type=token&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scopes)}&prompt=consent`;
+  const finalUrl = await new Promise((resolve, reject) => {
+    chrome.identity.launchWebAuthFlow({ url: authUrl, interactive: true }, (url) => {
+      if (chrome.runtime.lastError || !url) {
+        reject(new Error(chrome.runtime.lastError?.message || "OAuth flow failed."));
         return;
       }
-      resolve(token);
+      resolve(url);
     });
   });
+  const hash = new URL(finalUrl).hash.replace(/^#/, "");
+  const params = new URLSearchParams(hash);
+  const token = params.get("access_token");
+  const expiresIn = Number(params.get("expires_in") || "3600");
+  if (!token) throw new Error("OAuth token missing from response.");
+  const tokenExpiresAt = Date.now() + expiresIn * 1000;
+  await chrome.storage.local.set({ oauthAccessToken: token, oauthTokenExpiresAt: tokenExpiresAt });
+  return token;
 }
 
 async function googleApi(path, token, method = "GET", body, headers = {}) {
