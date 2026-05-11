@@ -5,7 +5,13 @@ document.getElementById("convert-current").addEventListener("click", async () =>
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) return;
   chrome.tabs.sendMessage(tab.id, { type: "convertDocTokens" }, (response) => {
-    statusEl.textContent = response?.ok ? "Converted tokens in document." : "Could not convert in this tab.";
+    if (chrome.runtime.lastError) {
+      statusEl.textContent = `Could not convert in this tab: ${chrome.runtime.lastError.message}`;
+      return;
+    }
+    statusEl.textContent = response?.ok
+      ? `Converted ${response.replacedCount || 0} token group(s). Imported ${response.imported || 0} new reference(s).`
+      : `Could not convert in this tab: ${response?.error || "Unknown error"}`;
   });
 });
 

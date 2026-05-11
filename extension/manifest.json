@@ -10,15 +10,9 @@
     "https://eutils.ncbi.nlm.nih.gov/*",
     "https://www.googleapis.com/*"
   ],
-  "oauth2": {
-    "client_id": "REPLACE_WITH_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com",
-    "scopes": [
-      "https://www.googleapis.com/auth/drive.appdata"
-    ]
-  },
   "action": {
     "default_title": "RefManager",
-    "default_popup": "src/popup.html"
+    "default_popup": "src/landing.html"
   },
   "options_page": "src/options.html",
   "background": {
