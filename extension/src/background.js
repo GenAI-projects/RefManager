@@ -130,7 +130,8 @@ async function getAuthToken(interactive = false) {
   const finalUrl = await new Promise((resolve, reject) => {
     chrome.identity.launchWebAuthFlow({ url: authUrl, interactive: true }, (url) => {
       if (chrome.runtime.lastError || !url) {
-        reject(new Error(chrome.runtime.lastError?.message || "OAuth flow failed."));
+        const launchError = chrome.runtime.lastError?.message || "OAuth flow failed.";
+        reject(new Error(`${launchError} Expected redirect URI: ${redirectUri}. OAuth client ID: ${oauthClientId}`));
         return;
       }
       resolve(url);

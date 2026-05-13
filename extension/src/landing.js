@@ -1,6 +1,8 @@
 const statusEl = document.getElementById('status');
 const clientIdInput = document.getElementById('client-id');
-document.getElementById('redirect-uri').textContent = chrome.identity.getRedirectURL();
+const redirectUri = chrome.identity.getRedirectURL();
+document.getElementById('redirect-uri').textContent = redirectUri;
+document.getElementById('extension-id').textContent = chrome.runtime.id;
 
 function setStatus(lines) {
   statusEl.textContent = Array.isArray(lines) ? lines.join('\n') : lines;
@@ -17,7 +19,20 @@ document.getElementById('save-client').addEventListener('click', () => {
 
 document.getElementById('login').addEventListener('click', () => {
   chrome.runtime.sendMessage({ type: 'googleLogin' }, (res) => {
-    if (!res?.ok) return setStatus(`Login failed: ${res?.error || 'Unknown error'}`);
+    if (!res?.ok) {
+      const error = res?.error || 'Unknown error';
+      if (error.includes('redirect_uri_mismatch')) {
+        return setStatus([
+          `Login failed: ${error}`,
+          'Fix checklist:',
+          '1) In Google Cloud, use OAuth client type: Web application.',
+          `2) Add this exact redirect URI: ${redirectUri}`,
+          '3) Ensure you saved the matching OAuth Client ID in this page.',
+          '4) If extension ID changed, update redirect URI for the new ID.'
+        ]);
+      }
+      return setStatus(`Login failed: ${error}`);
+    }
     setStatus([`Signed in as: ${res.email || 'Unknown account'}`, `Scopes: ${res.scopes?.join(', ') || 'Unknown'}`]);
   });
 });
