@@ -8,13 +8,29 @@ function setStatus(lines) {
   statusEl.textContent = Array.isArray(lines) ? lines.join('\n') : lines;
 }
 
-chrome.storage.local.get(["oauthClientId"], ({ oauthClientId }) => {
+function updateLoginState() {
+  const loginBtn = document.getElementById('login');
+  const hasClient = Boolean(clientIdInput.value.trim());
+  loginBtn.disabled = !hasClient;
+  if (!hasClient) setStatus('Enter and save your OAuth Client ID before login.');
+}
+
+clientIdInput.addEventListener('input', updateLoginState);
+
+chrome.storage.local.get(["oauthClientId", "oauthAccessToken", "oauthTokenExpiresAt"], ({ oauthClientId, oauthAccessToken, oauthTokenExpiresAt }) => {
   clientIdInput.value = oauthClientId || "";
+  if (oauthAccessToken && Date.now() < (oauthTokenExpiresAt || 0)) {
+    setStatus('Already logged in. You can run Drive Permission Check or open Quick Actions.');
+  }
+  updateLoginState();
 });
 
 document.getElementById('save-client').addEventListener('click', () => {
   const oauthClientId = clientIdInput.value.trim();
-  chrome.storage.local.set({ oauthClientId }, () => setStatus(oauthClientId ? "Client ID saved." : "Client ID cleared."));
+  chrome.storage.local.set({ oauthClientId }, () => {
+    updateLoginState();
+    setStatus(oauthClientId ? 'Client ID saved. You can now login.' : 'Client ID cleared.');
+  });
 });
 
 document.getElementById('login').addEventListener('click', () => {

@@ -126,7 +126,7 @@ async function getAuthToken(interactive = false) {
     "https://www.googleapis.com/auth/drive.metadata.readonly",
     "https://www.googleapis.com/auth/userinfo.email"
   ].join(" ");
-  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(oauthClientId)}&response_type=token&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scopes)}&prompt=consent`;
+  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(oauthClientId)}&response_type=token&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scopes)}&include_granted_scopes=true&prompt=consent`;
   const finalUrl = await new Promise((resolve, reject) => {
     chrome.identity.launchWebAuthFlow({ url: authUrl, interactive: true }, (url) => {
       if (chrome.runtime.lastError || !url) {
@@ -183,7 +183,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         await saveLibrary([...library, record]);
         sendResponse({ ok: true, record });
       } catch (error) {
-        sendResponse({ ok: false, error: error.message });
+        sendResponse({ ok: false, error: `${error.message}. If this is 403, re-login with consent and ensure Drive API is enabled for this OAuth project.` });
       }
       return;
     }
@@ -268,6 +268,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       } catch (error) {
         sendResponse({ ok: false, error: error.message });
       }
+      return;
+    }
+
+    if (message?.type === "linkCurrentDoc") {
+      const docId = (message.docId || '').trim();
+      if (!docId) {
+        sendResponse({ ok: false, error: 'Missing Google Doc ID.' });
+        return;
+      }
+      const docName = (message.docName || 'Google Doc').replace(/\s+-\s+Google Docs\s*$/i, '').trim();
+      const updated = { ...(librariesByDoc || {}) };
+      updated[docId] = { docName, library: updated[docId]?.library || library, updatedAt: new Date().toISOString(), url: message.url || '' };
+      await chrome.storage.local.set({ librariesByDoc: updated, activeDocKey: docId });
+      sendResponse({ ok: true, docId, docName });
       return;
     }
 
