@@ -11,9 +11,18 @@ function getDocContext() {
 function parseDoiGroup(group) { return group.split(";").map((x) => x.trim()).filter((x) => x && x.includes("/")); }
 function parsePmidGroup(group) { return group.split(";").map((x) => x.replace(/PMID:\s*/gi, "").trim()).filter(Boolean); }
 
+
+function getEditorRoots() {
+  const roots = [
+    ...document.querySelectorAll('[contenteditable="true"]'),
+    ...document.querySelectorAll('[role="textbox"]')
+  ];
+  return roots.length ? roots : [document.body];
+}
+
 function collectTokenGroups() {
   const groups = [];
-  document.querySelectorAll('[contenteditable="true"]').forEach((root) => {
+  getEditorRoots().forEach((root) => {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     let current;
     while ((current = walker.nextNode())) {
@@ -55,7 +64,7 @@ function replacePatternInText(node, pattern, parser, replacements, label) {
 }
 function processEditableRoots(replacements) {
   let replaced = 0;
-  document.querySelectorAll('[contenteditable="true"]').forEach((root) => {
+  getEditorRoots().forEach((root) => {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     const nodes = []; let current;
     while ((current = walker.nextNode())) nodes.push(current);
@@ -75,7 +84,7 @@ function formatCitationField(indices) {
 }
 function refreshCitationSpanOrder() {
   const refOrder = new Map(); let nextIndex = 1;
-  document.querySelectorAll('[contenteditable="true"] .refmanager-citation').forEach((span) => {
+  getEditorRoots().flatMap((root) => [...root.querySelectorAll('.refmanager-citation')]).forEach((span) => {
     let payload = {};
     try { payload = JSON.parse(span.dataset.refmanager || "{}"); } catch (_err) {}
     const label = payload.label || "DOI";
@@ -98,7 +107,7 @@ function convertDocTokensWithAutoLookup(sendResponse) {
       const replacements = new Map((response.replacements || []).map((r) => [r.key, { display: r.display }]));
       const replacedCount = processEditableRoots(replacements);
       refreshCitationSpanOrder();
-      if (!replacedCount) return sendResponse({ ok: false, error: "No DOI/PMID token groups were found in editable text nodes to replace." });
+      if (!replacedCount) return sendResponse({ ok: false, error: `No DOI/PMID token groups were found to replace. Found groups: ${(collectTokenGroups() || []).length}.` });
       sendResponse({ ok: true, imported: response.imported, failed: response.failed, replacedCount });
     });
   } catch (error) { sendResponse({ ok: false, error: error.message || "Token conversion failed." }); }
