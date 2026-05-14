@@ -8,8 +8,21 @@ function parseDoc(url = "") {
 }
 
 async function getActiveTab() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   return tab;
+}
+
+
+function renderLinkedDocStatus(docName) {
+  linkedDocEl.textContent = docName ? `Linked doc: ${docName}` : "No doc linked yet.";
+}
+
+async function refreshLinkedDocFromActiveTab() {
+  const tab = await getActiveTab();
+  const docId = parseDoc(tab?.url || "");
+  if (!docId) return renderLinkedDocStatus("");
+  const cleanName = (tab.title || "Google Doc").replace(/\s+-\s+Google Docs\s*$/i, "").trim();
+  renderLinkedDocStatus(cleanName || "Google Doc");
 }
 
 async function ensureContentScript(tab) {
@@ -73,7 +86,6 @@ form.addEventListener("submit", (event) => {
 
 document.getElementById("open-library").addEventListener("click", () => chrome.runtime.openOptionsPage());
 
-chrome.storage.local.get(["activeDocKey", "librariesByDoc"], ({ activeDocKey, librariesByDoc }) => {
-  const doc = activeDocKey ? librariesByDoc?.[activeDocKey] : null;
-  linkedDocEl.textContent = doc ? `Linked doc: ${doc.docName}` : "No doc linked yet.";
-});
+
+
+refreshLinkedDocFromActiveTab();
