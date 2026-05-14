@@ -3,7 +3,7 @@ const statusEl = document.getElementById("status");
 const linkedDocEl = document.getElementById("linked-doc");
 
 function parseDoc(url = "") {
-  const match = url.match(/https:\/\/docs\.google\.com\/document\/d\/([^/]+)/);
+  const match = url.match(/https:\/\/docs\.google\.com\/document\/(?:u\/\d+\/)?d\/([^/?#]+)/);
   return match?.[1] || null;
 }
 

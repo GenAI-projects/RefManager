@@ -1,6 +1,25 @@
 const DOI_PATTERN = /^10\.\d{4,9}\/[-._;()/:A-Z0-9]+$/i;
 const PMID_PATTERN = /^\d{1,10}$/;
 
+const REQUIRED_SCOPES = [
+  "https://www.googleapis.com/auth/drive.appdata",
+  "https://www.googleapis.com/auth/drive.file",
+  "https://www.googleapis.com/auth/drive.metadata.readonly",
+  "https://www.googleapis.com/auth/userinfo.email"
+];
+
+async function tokenHasRequiredScopes(token) {
+  try {
+    const res = await fetch(`https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=${encodeURIComponent(token)}`);
+    if (!res.ok) return false;
+    const payload = await res.json();
+    const granted = new Set(String(payload.scope || "").split(/\s+/).filter(Boolean));
+    return REQUIRED_SCOPES.every((scope) => granted.has(scope));
+  } catch (_error) {
+    return false;
+  }
+}
+
 async function getLibrary() {
   const { library = [], citationStyle = "apa", librariesByDoc = {}, activeDocKey = null } = await chrome.storage.local.get(["library", "citationStyle", "librariesByDoc", "activeDocKey"]);
   return { library, citationStyle, librariesByDoc, activeDocKey };
@@ -115,17 +134,12 @@ function formatCitation(record, style) {
 
 async function getAuthToken(interactive = false) {
   const { oauthAccessToken, oauthTokenExpiresAt = 0, oauthClientId = "" } = await chrome.storage.local.get(["oauthAccessToken", "oauthTokenExpiresAt", "oauthClientId"]);
-  if (oauthAccessToken && Date.now() < oauthTokenExpiresAt - 60_000) return oauthAccessToken;
+  if (oauthAccessToken && Date.now() < oauthTokenExpiresAt - 60_000 && await tokenHasRequiredScopes(oauthAccessToken)) return oauthAccessToken;
   if (!interactive) throw new Error("Authentication required.");
   if (!oauthClientId) throw new Error("Google OAuth Client ID is not configured. Set it on the landing page.");
 
   const redirectUri = chrome.identity.getRedirectURL();
-  const scopes = [
-    "https://www.googleapis.com/auth/drive.appdata",
-    "https://www.googleapis.com/auth/drive.file",
-    "https://www.googleapis.com/auth/drive.metadata.readonly",
-    "https://www.googleapis.com/auth/userinfo.email"
-  ].join(" ");
+  const scopes = REQUIRED_SCOPES.join(" ");
   const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(oauthClientId)}&response_type=token&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scopes)}&include_granted_scopes=true&prompt=consent`;
   const finalUrl = await new Promise((resolve, reject) => {
     chrome.identity.launchWebAuthFlow({ url: authUrl, interactive: true }, (url) => {
@@ -157,7 +171,14 @@ async function googleApi(path, token, method = "GET", body, headers = {}) {
     },
     body: body ? JSON.stringify(body) : undefined
   });
-  if (!response.ok) throw new Error(`Google API ${method} ${path} failed: ${response.status}`);
+  if (!response.ok) {
+    let details = "";
+    try {
+      const err = await response.json();
+      details = err?.error?.message ? ` - ${err.error.message}` : "";
+    } catch (_error) {}
+    throw new Error(`Google API ${method} ${path} failed: ${response.status}${details}`);
+  }
   if (response.status === 204) return {};
   return response.json();
 }
