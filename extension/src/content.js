@@ -32,8 +32,8 @@ function collectTokenGroups() {
       DOI_GROUP_PATTERN.lastIndex = 0;
       PMID_GROUP_PATTERN.lastIndex = 0;
       let m;
-      while ((m = DOI_GROUP_PATTERN.exec(text)) !== null) groups.push({ label: "DOI", ids: parseDoiGroup(m[1]) });
-      while ((m = PMID_GROUP_PATTERN.exec(text)) !== null) groups.push({ label: "PMID", ids: parsePmidGroup(m[1]) });
+      while ((m = DOI_GROUP_PATTERN.exec(text)) !== null) groups.push({ label: "DOI", ids: parseDoiGroup(m[1]), rawToken: m[0] });
+      while ((m = PMID_GROUP_PATTERN.exec(text)) !== null) groups.push({ label: "PMID", ids: parsePmidGroup(m[1]), rawToken: m[0] });
     }
   });
   return groups;
@@ -109,6 +109,8 @@ function convertDocTokensWithAutoLookup(sendResponse) {
       const replacements = new Map((response.replacements || []).map((r) => [r.key, { display: r.display }]));
       const replacedCount = processEditableRoots(replacements);
       refreshCitationSpanOrder();
+      const tokenReplacements = (response.replacements || []).filter((r) => r.rawToken).map((r) => ({ rawToken: r.rawToken, display: r.display }));
+      chrome.runtime.sendMessage({ type: "applyDocCitationsAndReferences", docId: getDocContext().docId, tokenReplacements }, () => {});
       if (!replacedCount) return sendResponse({ ok: false, error: `No DOI/PMID token groups were found to replace. Found groups: ${(collectTokenGroups() || []).length}.` });
       sendResponse({ ok: true, imported: response.imported, failed: response.failed, replacedCount });
     });

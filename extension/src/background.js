@@ -5,7 +5,8 @@ const REQUIRED_SCOPES = [
   "https://www.googleapis.com/auth/drive.appdata",
   "https://www.googleapis.com/auth/drive.file",
   "https://www.googleapis.com/auth/drive.metadata.readonly",
-  "https://www.googleapis.com/auth/userinfo.email"
+  "https://www.googleapis.com/auth/userinfo.email",
+  "https://www.googleapis.com/auth/documents"
 ];
 
 async function tokenHasRequiredScopes(token) {
@@ -315,6 +316,37 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return;
     }
 
+    if (message?.type === "applyDocCitationsAndReferences") {
+      try {
+        const docId = (message.docId || "").trim();
+        if (!docId) throw new Error("Missing docId for Docs update.");
+        const token = await getAuthToken(true);
+        const tokenReplacements = Array.isArray(message.tokenReplacements) ? message.tokenReplacements : [];
+        const replaceRequests = tokenReplacements.map((r) => ({
+          replaceAllText: {
+            containsText: { text: r.rawToken, matchCase: true },
+            replaceText: `[${r.display}]`
+          }
+        }));
+        const scoped = (librariesByDoc?.[docId]?.library || library);
+        const references = scoped.map((rec, i) => `${i + 1}. ${formatCitation(rec, citationStyle)}`).join("\n");
+        const marker = "References (RefManager)";
+        const docMeta = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
+        const endIndex = docMeta?.body?.content?.[docMeta.body.content.length - 1]?.endIndex || 1;
+        const insertText = `
+
+${marker}
+${references}
+`;
+        const requests = [...replaceRequests, { insertText: { location: { index: Math.max(1, endIndex - 1) }, text: insertText } }];
+        await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}:batchUpdate`, token, "POST", { requests });
+        sendResponse({ ok: true });
+      } catch (error) {
+        sendResponse({ ok: false, error: error.message });
+      }
+      return;
+    }
+
     if (message?.type === "mergeDuplicates") {
       const seen = new Map();
       const merged = [];
@@ -355,7 +387,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         }
 
         const key = `${mode === "pmid" ? "PMID" : "DOI"}|${ids.join(";")}`;
-        replacements.push({ key, display: formatCitationField(citationIndexes) });
+        replacements.push({ key, display: formatCitationField(citationIndexes), rawToken: group.rawToken || "" });
       }
 
       await saveLibraryForDoc(docKey, docName, workingLibrary, librariesByDoc);
