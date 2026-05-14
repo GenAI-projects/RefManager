@@ -133,6 +133,32 @@ function formatCitation(record, style) {
   return `${authors} (${record.year}). ${record.title}. ${record.journal}.`;
 }
 
+function extractTokenGroupsFromText(text = "") {
+  const groups = [];
+  const doiPattern = /\{([^{}]*10\.\d{4,9}\/[\-._;()/:A-Z0-9]+[^{}]*)\}/gi;
+  const pmidPattern = /\{([^{}]*PMID:\s*\d+[^{}]*)\}/gi;
+  let match;
+  while ((match = doiPattern.exec(text)) !== null) {
+    groups.push({ label: "DOI", ids: match[1].split(";").map((x) => x.trim()).filter((x) => x && x.includes("/")), rawToken: match[0] });
+  }
+  while ((match = pmidPattern.exec(text)) !== null) {
+    groups.push({ label: "PMID", ids: match[1].split(";").map((x) => x.replace(/PMID:\s*/gi, "").trim()).filter(Boolean), rawToken: match[0] });
+  }
+  return groups;
+}
+
+async function loadDocPlainText(docId, token) {
+  const doc = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
+  const pieces = [];
+  for (const item of (doc?.body?.content || [])) {
+    const elements = item?.paragraph?.elements || [];
+    for (const el of elements) {
+      if (el?.textRun?.content) pieces.push(el.textRun.content);
+    }
+  }
+  return pieces.join("");
+}
+
 async function getAuthToken(interactive = false) {
   const { oauthAccessToken, oauthTokenExpiresAt = 0, oauthClientId = "" } = await chrome.storage.local.get(["oauthAccessToken", "oauthTokenExpiresAt", "oauthClientId"]);
   if (oauthAccessToken && Date.now() < oauthTokenExpiresAt - 60_000 && await tokenHasRequiredScopes(oauthAccessToken)) return oauthAccessToken;
@@ -370,7 +396,18 @@ ${references}
       const failed = [];
       const replacements = [];
 
-      for (const group of (message.groups || [])) {
+      let incomingGroups = Array.isArray(message.groups) ? message.groups : [];
+      if (!incomingGroups.length && message.docId) {
+        try {
+          const token = await getAuthToken(false);
+          const docText = await loadDocPlainText(message.docId, token);
+          incomingGroups = extractTokenGroupsFromText(docText);
+        } catch (_error) {
+          incomingGroups = [];
+        }
+      }
+
+      for (const group of incomingGroups) {
         const mode = (group.label || "").toLowerCase() === "pmid" ? "pmid" : "doi";
         const ids = (group.ids || []).map((x) => normalizeIdentifier(mode === "pmid" ? String(x).replace(/^PMID:/i, "") : x)).filter(Boolean);
         const citationIndexes = [];
@@ -391,7 +428,7 @@ ${references}
       }
 
       await saveLibraryForDoc(docKey, docName, workingLibrary, librariesByDoc);
-      sendResponse({ ok: true, replacements, imported, failed, docKey, docName });
+      sendResponse({ ok: true, replacements, imported, failed, docKey, docName, foundGroups: incomingGroups.length });
       return;
     }
 

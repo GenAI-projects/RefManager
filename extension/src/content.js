@@ -111,7 +111,9 @@ function convertDocTokensWithAutoLookup(sendResponse) {
       refreshCitationSpanOrder();
       const tokenReplacements = (response.replacements || []).filter((r) => r.rawToken).map((r) => ({ rawToken: r.rawToken, display: r.display }));
       chrome.runtime.sendMessage({ type: "applyDocCitationsAndReferences", docId: getDocContext().docId, tokenReplacements }, () => {});
-      if (!replacedCount) return sendResponse({ ok: false, error: `No DOI/PMID token groups were found to replace. Found groups: ${(collectTokenGroups() || []).length}.` });
+      if (!replacedCount && !response?.foundGroups) {
+        return sendResponse({ ok: false, error: `No DOI/PMID token groups were found to replace. Found groups: ${(collectTokenGroups() || []).length}.` });
+      }
       sendResponse({ ok: true, imported: response.imported, failed: response.failed, replacedCount });
     });
   } catch (error) { sendResponse({ ok: false, error: error.message || "Token conversion failed." }); }
