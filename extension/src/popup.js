@@ -34,6 +34,12 @@ async function refreshLinkedDocFromActiveTab() {
   renderLinkedDocStatus(cleanName || "Google Doc");
 }
 
+
+async function findDocTabById(docId) {
+  const tabs = await chrome.tabs.query({});
+  return tabs.find((t) => parseDoc(t.url || "") === docId) || null;
+}
+
 async function ensureContentScript(tab) {
   try {
     await chrome.tabs.sendMessage(tab.id, { type: "pingRefManager" });
@@ -53,12 +59,18 @@ document.getElementById("convert-current").addEventListener("click", async () =>
     return;
   }
 
+  const targetTab = parseDoc(tab.url || "") ? tab : await findDocTabById(activeDocId);
+  if (!targetTab?.id) {
+    statusEl.textContent = "Could not find an open tab for that Doc ID. Open the target Google Doc tab and try again.";
+    return;
+  }
+
   try {
     if (!parseDoc(tab.url || "")) {
-      statusEl.textContent = "Using manual Doc ID fallback. Keep the target Google Doc tab focused for conversion.";
+      statusEl.textContent = "Using manual Doc ID fallback with a matching open Google Doc tab.";
     }
-    await ensureContentScript(tab);
-    chrome.tabs.sendMessage(tab.id, { type: "convertDocTokens" }, (response) => {
+    await ensureContentScript(targetTab);
+    chrome.tabs.sendMessage(targetTab.id, { type: "convertDocTokens" }, (response) => {
       if (chrome.runtime.lastError) {
         statusEl.textContent = `Could not convert in this tab: ${chrome.runtime.lastError.message}`;
         return;
