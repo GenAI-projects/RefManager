@@ -1,10 +1,19 @@
 const form = document.getElementById("id-form");
 const statusEl = document.getElementById("status");
 const linkedDocEl = document.getElementById("linked-doc");
+const manualDocIdInput = document.getElementById("manual-doc-id");
 
 function parseDoc(url = "") {
   const match = url.match(/https:\/\/docs\.google\.com\/document\/(?:u\/\d+\/)?d\/([^/?#]+)/);
   return match?.[1] || null;
+}
+
+
+function sanitizeDocId(raw = "") {
+  const text = raw.trim();
+  if (!text) return "";
+  const fromUrl = text.match(/\/document\/(?:u\/\d+\/)?d\/([^/?#]+)/);
+  return fromUrl?.[1] || text;
 }
 
 async function getActiveTab() {
@@ -38,12 +47,16 @@ async function ensureContentScript(tab) {
 document.getElementById("convert-current").addEventListener("click", async () => {
   const tab = await getActiveTab();
   if (!tab?.id) return;
-  if (!parseDoc(tab.url || "")) {
-    statusEl.textContent = "Open a Google Doc tab first, then run conversion.";
+  const activeDocId = parseDoc(tab.url || "") || sanitizeDocId(manualDocIdInput.value);
+  if (!activeDocId) {
+    statusEl.textContent = "Open a Google Doc tab first, or enter Manual Google Doc ID.";
     return;
   }
 
   try {
+    if (!parseDoc(tab.url || "")) {
+      statusEl.textContent = "Using manual Doc ID fallback. Keep the target Google Doc tab focused for conversion.";
+    }
     await ensureContentScript(tab);
     chrome.tabs.sendMessage(tab.id, { type: "convertDocTokens" }, (response) => {
       if (chrome.runtime.lastError) {
@@ -73,6 +86,23 @@ document.getElementById("link-current").addEventListener("click", async () => {
     }
     linkedDocEl.textContent = `Linked doc: ${res.docName}`;
     statusEl.textContent = "Current document linked for RefManager actions.";
+  });
+});
+
+
+document.getElementById("link-manual").addEventListener("click", () => {
+  const docId = sanitizeDocId(manualDocIdInput.value);
+  if (!docId) {
+    statusEl.textContent = "Enter a Google Doc ID (or full URL) first.";
+    return;
+  }
+  chrome.runtime.sendMessage({ type: "linkCurrentDoc", docId, docName: `Manual Doc ${docId.slice(0, 8)}...`, url: "" }, (res) => {
+    if (!res?.ok) {
+      statusEl.textContent = res?.error || "Could not link this document.";
+      return;
+    }
+    renderLinkedDocStatus(res.docName);
+    statusEl.textContent = "Manual document link saved.";
   });
 });
 
