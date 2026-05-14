@@ -5,6 +5,12 @@
 <p>Sign in to Google and verify Drive permissions before using automatic sync.</p>
 <label>Google OAuth Client ID <input id="client-id" style="width:100%" placeholder="YOUR_CLIENT_ID.apps.googleusercontent.com"/></label>
 <p><strong>Authorized redirect URI to add in Google Cloud:</strong><br/><code id="redirect-uri"></code></p>
+<p><strong>Extension ID:</strong> <code id="extension-id"></code></p>
+<ul>
+<li>Create an <strong>OAuth 2.0 Client ID</strong> of type <strong>Web application</strong> in Google Cloud.</li>
+<li>Add the exact redirect URI shown above under that client.</li>
+<li>If you load this extension unpacked on another machine/profile, the extension ID can change, so that user must register their own redirect URI.</li>
+</ul>
 <div class="toolbar">
   <button id="save-client">Save Client ID</button>
   <button id="login">Login to Google</button>
