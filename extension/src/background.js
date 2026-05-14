@@ -298,7 +298,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         sendResponse({ ok: false, error: 'Missing Google Doc ID.' });
         return;
       }
-      const docName = (message.docName || 'Google Doc').replace(/\s+-\s+Google Docs\s*$/i, '').trim();
+      let docName = (message.docName || 'Google Doc').replace(/\s+-\s+Google Docs\s*$/i, '').trim();
+      if (!docName || /^Manual Doc\b/i.test(docName)) {
+        try {
+          const token = await getAuthToken(false);
+          const fileMeta = await googleApi(`/drive/v3/files/${encodeURIComponent(docId)}?fields=id,name,mimeType`, token);
+          if (fileMeta?.name) docName = fileMeta.name;
+        } catch (_error) {
+          // best effort; keep provided name when metadata lookup is unavailable
+        }
+      }
       const updated = { ...(librariesByDoc || {}) };
       updated[docId] = { docName, library: updated[docId]?.library || library, updatedAt: new Date().toISOString(), url: message.url || '' };
       await chrome.storage.local.set({ librariesByDoc: updated, activeDocKey: docId });

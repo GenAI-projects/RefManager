@@ -17,7 +17,9 @@ function getEditorRoots() {
     ...document.querySelectorAll('[contenteditable="true"]'),
     ...document.querySelectorAll('[role="textbox"]')
   ];
-  return roots.length ? roots : [document.body];
+  const unique = new Set(roots.filter(Boolean));
+  unique.add(document.body);
+  return [...unique];
 }
 
 function collectTokenGroups() {
