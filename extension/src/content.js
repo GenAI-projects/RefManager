@@ -3,7 +3,7 @@ const PMID_GROUP_PATTERN = /\{([^{}]*PMID:\s*\d+[^{}]*)\}/gi;
 
 function normalizeToken(id) { return String(id || "").trim().replace(/\s+/g, ""); }
 function getDocContext() {
-  const match = window.location.pathname.match(/\/document\/d\/([^/]+)/);
+  const match = window.location.pathname.match(/\/document\/(?:u\/\d+\/)?d\/([^/]+)/);
   const docId = match?.[1] || document.title || "default-doc";
   const cleanTitle = (document.title || "Untitled Doc").replace(/\s+-\s+Google Docs\s*$/i, "").trim();
   return { docId, docName: cleanTitle || "Untitled Doc" };
