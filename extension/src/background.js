@@ -1,4 +1,4 @@
-const DOI_PATTERN = /^10\.\d{4,9}\/[-._;()/:A-Z0-9]+$/i;
+const DOI_PATTERN = /^10\.\d{4,9}\/\S+$/i;
 const PMID_PATTERN = /^\d{1,10}$/;
 
 const REQUIRED_SCOPES = [
