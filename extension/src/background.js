@@ -164,6 +164,105 @@ function parseDocIdFromUrl(url = "") {
   return match?.[1] || "";
 }
 
+async function ingestAndBuildForDoc({ docId, docName, library, librariesByDoc }) {
+  const docKey = docId || "default-doc";
+  const scopedLibrary = librariesByDoc?.[docKey]?.library || library;
+  let workingLibrary = [...scopedLibrary];
+  let imported = 0;
+  const failed = [];
+  const replacements = [];
+
+  const token = await getAuthToken(true);
+  const docText = await loadDocPlainText(docId, token);
+  const incomingGroups = extractTokenGroupsFromText(docText);
+
+  for (const group of incomingGroups) {
+    const mode = (group.label || "").toLowerCase() === "pmid" ? "pmid" : "doi";
+    const ids = (group.ids || []).map((x) => normalizeIdentifier(mode === "pmid" ? String(x).replace(/^PMID:/i, "") : x)).filter(Boolean);
+    const citationIndexes = [];
+    for (const id of ids) {
+      try {
+        const result = await upsertIdentifier(mode, id, workingLibrary);
+        workingLibrary = result.library;
+        if (result.imported) imported += 1;
+        if (result.record) citationIndexes.push(workingLibrary.indexOf(result.record) + 1);
+      } catch (error) {
+        failed.push({ id, error: error.message });
+      }
+    }
+    const key = `${mode === "pmid" ? "PMID" : "DOI"}|${ids.join(";")}`;
+    replacements.push({ key, display: formatCitationField(citationIndexes), rawToken: group.rawToken || "" });
+  }
+
+  await saveLibraryForDoc(docKey, docName || "Google Doc", workingLibrary, librariesByDoc);
+  return { replacements, imported, failed, foundGroups: incomingGroups.length, docKey, workingLibrary };
+}
+
+async function getAuthenticatedProfileEmail() {
+  try {
+    const token = await getAuthToken(false);
+    const profile = await googleApi("/oauth2/v2/userinfo", token);
+    return profile?.email || "unknown-account";
+  } catch (_error) {
+    return "unknown-account";
+  }
+}
+
+async function diagnoseDocAccess(docId) {
+  const token = await getAuthToken(true);
+  const encoded = encodeURIComponent(docId);
+  const authEmail = await getAuthenticatedProfileEmail();
+  try {
+    const fileMeta = await googleApi(`/drive/v3/files/${encoded}?fields=id,name,mimeType,owners(emailAddress)&supportsAllDrives=true`, token);
+    if (fileMeta?.mimeType !== "application/vnd.google-apps.document") {
+      return `ID resolves, but it is not a Google Doc (mimeType=${fileMeta?.mimeType || "unknown"}).`;
+    }
+    return `Drive can see this Doc as \"${fileMeta?.name || docId}\" for ${authEmail}. If Docs API still fails, re-login and verify the OAuth client belongs to the same Google account.`;
+  } catch (error) {
+    const msg = String(error?.message || "");
+    if (msg.includes("failed: 404")) {
+      return `Drive cannot find this Doc ID for ${authEmail} (404). Common causes: wrong Doc ID, Doc belongs to a different Google account, or the Doc is not shared with the authenticated account.`;
+    }
+    if (msg.includes("failed: 403")) {
+      return `Drive access is forbidden (403) for ${authEmail}. Re-run Google login consent and ensure Drive API + Google Docs API are enabled for this OAuth client.`;
+    }
+    return `Drive access check failed for ${authEmail}: ${msg || "unknown error"}`;
+  }
+}
+
+async function applyDocCitationsAndReferencesForLibrary({ docId, tokenReplacements, citationStyle, scopedLibrary }) {
+  const token = await getAuthToken(true);
+  const replaceRequests = tokenReplacements.map((r) => ({
+    replaceAllText: {
+      containsText: { text: r.rawToken, matchCase: true },
+      replaceText: `[${r.display}]`
+    }
+  }));
+  const citedDisplays = new Set(tokenReplacements.map((r) => String(r.display || "")).filter(Boolean));
+  const citedIndices = [...citedDisplays]
+    .flatMap((d) => d.split(/[,-]/).map((n) => Number(n.trim())).filter((n) => Number.isInteger(n) && n > 0));
+  const uniqueIndices = [...new Set(citedIndices)].sort((a, b) => a - b);
+  const references = uniqueIndices.map((idx) => {
+    const rec = scopedLibrary[idx - 1];
+    return rec ? `${idx}. ${formatCitation(rec, citationStyle)}` : "";
+  }).filter(Boolean).join("\n");
+  if (!replaceRequests.length && !references) return { ok: true, skipped: true };
+  const marker = "References (RefManager)";
+  const docMeta = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
+  const endIndex = docMeta?.body?.content?.[docMeta.body.content.length - 1]?.endIndex || 1;
+  const requests = [...replaceRequests];
+  if (references) {
+    requests.push({
+      insertText: {
+        location: { index: Math.max(1, endIndex - 1) },
+        text: `\n\n${marker}\n${references}\n`
+      }
+    });
+  }
+  await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}:batchUpdate`, token, "POST", { requests });
+  return { ok: true };
+}
+
 async function getAuthToken(interactive = false) {
   const { oauthAccessToken, oauthTokenExpiresAt = 0, oauthClientId = "" } = await chrome.storage.local.get(["oauthAccessToken", "oauthTokenExpiresAt", "oauthClientId"]);
   if (oauthAccessToken && Date.now() < oauthTokenExpiresAt - 60_000 && await tokenHasRequiredScopes(oauthAccessToken)) return oauthAccessToken;
@@ -351,27 +450,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       try {
         const docId = (message.docId || "").trim();
         if (!docId) throw new Error("Missing docId for Docs update.");
-        const token = await getAuthToken(true);
         const tokenReplacements = Array.isArray(message.tokenReplacements) ? message.tokenReplacements : [];
-        const replaceRequests = tokenReplacements.map((r) => ({
-          replaceAllText: {
-            containsText: { text: r.rawToken, matchCase: true },
-            replaceText: `[${r.display}]`
-          }
-        }));
         const scoped = (librariesByDoc?.[docId]?.library || library);
-        const references = scoped.map((rec, i) => `${i + 1}. ${formatCitation(rec, citationStyle)}`).join("\n");
-        const marker = "References (RefManager)";
-        const docMeta = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
-        const endIndex = docMeta?.body?.content?.[docMeta.body.content.length - 1]?.endIndex || 1;
-        const insertText = `
-
-${marker}
-${references}
-`;
-        const requests = [...replaceRequests, { insertText: { location: { index: Math.max(1, endIndex - 1) }, text: insertText } }];
-        await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}:batchUpdate`, token, "POST", { requests });
-        sendResponse({ ok: true });
+        const result = await applyDocCitationsAndReferencesForLibrary({ docId, tokenReplacements, citationStyle, scopedLibrary: scoped });
+        sendResponse(result);
       } catch (error) {
         sendResponse({ ok: false, error: error.message });
       }
@@ -446,6 +528,27 @@ ${references}
 
       await saveLibraryForDoc(docKey, docName, workingLibrary, librariesByDoc);
       sendResponse({ ok: true, replacements, imported, failed, docKey, docName, foundGroups: incomingGroups.length, fallbackError });
+      return;
+    }
+
+    if (message?.type === "convertDocById") {
+      try {
+        const docId = (message.docId || "").trim();
+        if (!docId) throw new Error("Missing Google Doc ID.");
+        const built = await ingestAndBuildForDoc({ docId, docName: `Manual Doc ${docId.slice(0, 8)}...`, library, librariesByDoc });
+        const tokenReplacements = (built.replacements || []).filter((r) => r.rawToken).map((r) => ({ rawToken: r.rawToken, display: r.display }));
+        if (!built.foundGroups) throw new Error("No DOI/PMID token groups were found in this Google Doc.");
+        await applyDocCitationsAndReferencesForLibrary({ docId: built.docKey, tokenReplacements, citationStyle, scopedLibrary: built.workingLibrary });
+        sendResponse({ ok: true, replacedCount: tokenReplacements.length, imported: built.imported, failed: built.failed });
+      } catch (error) {
+        const raw = error?.message || "Document conversion failed.";
+        if (raw.includes("/docs/v1/documents/") && raw.includes("failed: 404")) {
+          const diagnostic = await diagnoseDocAccess((message.docId || "").trim());
+          sendResponse({ ok: false, error: `${raw}. ${diagnostic}` });
+          return;
+        }
+        sendResponse({ ok: false, error: raw });
+      }
       return;
     }
 
