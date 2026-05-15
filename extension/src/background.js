@@ -397,12 +397,14 @@ ${references}
       const replacements = [];
 
       let incomingGroups = Array.isArray(message.groups) ? message.groups : [];
+      let fallbackError = "";
       if (!incomingGroups.length && message.docId) {
         try {
-          const token = await getAuthToken(false);
+          const token = await getAuthToken(true);
           const docText = await loadDocPlainText(message.docId, token);
           incomingGroups = extractTokenGroupsFromText(docText);
-        } catch (_error) {
+        } catch (error) {
+          fallbackError = error?.message || "Docs API fallback failed.";
           incomingGroups = [];
         }
       }
@@ -428,7 +430,7 @@ ${references}
       }
 
       await saveLibraryForDoc(docKey, docName, workingLibrary, librariesByDoc);
-      sendResponse({ ok: true, replacements, imported, failed, docKey, docName, foundGroups: incomingGroups.length });
+      sendResponse({ ok: true, replacements, imported, failed, docKey, docName, foundGroups: incomingGroups.length, fallbackError });
       return;
     }
 
