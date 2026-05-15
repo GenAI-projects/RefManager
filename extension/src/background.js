@@ -391,42 +391,47 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 
     if (message?.type === "syncLibraryPush") {
-      const token = await getAuthToken(true);
-      const payload = {
-        updatedAt: new Date().toISOString(),
-        library,
-        csl: JSON.stringify(library),
-        bib: library.map((r, i) => `@article{ref${i + 1}, title={${r.title || ""}}, author={${r.authors || ""}}, year={${r.year || ""}}, doi={${r.doi || ""}}}`).join("\n\n"),
-        ris: library.map((r) => `TY  - JOUR\nTI  - ${r.title || ""}\nAU  - ${r.authors || ""}\nPY  - ${r.year || ""}\nDO  - ${r.doi || ""}\nER  -`).join("\n\n")
-      };
-      await chrome.storage.sync.set({ sharedLibraryPayload: payload });
-      const list = await googleApi("/drive/v3/files?q=name='refmanager-shared-library.json' and trashed=false and 'appDataFolder' in parents&spaces=appDataFolder&fields=files(id,name)", token);
-      const existingId = list?.files?.[0]?.id;
-      if (existingId) {
-        await fetch(`https://www.googleapis.com/upload/drive/v3/files/${existingId}?uploadType=media`, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-      } else {
-        const created = await googleApi("/drive/v3/files", token, "POST", { name: "refmanager-shared-library.json", parents: ["appDataFolder"] });
-        await fetch(`https://www.googleapis.com/upload/drive/v3/files/${created.id}?uploadType=media`, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      try {
+        const token = await getAuthToken(true);
+        const payload = {
+          updatedAt: new Date().toISOString(),
+          library,
+          csl: JSON.stringify(library),
+          bib: library.map((r, i) => `@article{ref${i + 1}, title={${r.title || ""}}, author={${r.authors || ""}}, year={${r.year || ""}}, doi={${r.doi || ""}}}`).join("\n\n"),
+          ris: library.map((r) => `TY  - JOUR\nTI  - ${r.title || ""}\nAU  - ${r.authors || ""}\nPY  - ${r.year || ""}\nDO  - ${r.doi || ""}\nER  -`).join("\n\n")
+        };
+        await chrome.storage.sync.set({ sharedLibraryPayload: payload });
+        const list = await googleApi("/drive/v3/files?q=name='refmanager-shared-library.json' and trashed=false and 'appDataFolder' in parents&spaces=appDataFolder&fields=files(id,name)", token);
+        const existingId = list?.files?.[0]?.id;
+        if (existingId) {
+          await googleApi(`/upload/drive/v3/files/${existingId}?uploadType=media`, token, "PATCH", payload);
+        } else {
+          const created = await googleApi("/drive/v3/files", token, "POST", { name: "refmanager-shared-library.json", parents: ["appDataFolder"] });
+          await googleApi(`/upload/drive/v3/files/${created.id}?uploadType=media`, token, "PATCH", payload);
+        }
+        sendResponse({ ok: true, count: library.length });
+      } catch (error) {
+        sendResponse({ ok: false, error: error.message });
       }
-      sendResponse({ ok: true, count: library.length });
       return;
     }
 
     if (message?.type === "syncLibraryPull") {
-      const token = await getAuthToken(true);
-      const list = await googleApi("/drive/v3/files?q=name='refmanager-shared-library.json' and trashed=false and 'appDataFolder' in parents&spaces=appDataFolder&fields=files(id,name)", token);
-      if (list?.files?.[0]?.id) {
-        const drivePayload = await fetch(`https://www.googleapis.com/drive/v3/files/${list.files[0].id}?alt=media`, { headers: { Authorization: `Bearer ${token}` } });
-        if (drivePayload.ok) {
-          const json = await drivePayload.json();
-          await chrome.storage.sync.set({ sharedLibraryPayload: json });
+      try {
+        const token = await getAuthToken(true);
+        const list = await googleApi("/drive/v3/files?q=name='refmanager-shared-library.json' and trashed=false and 'appDataFolder' in parents&spaces=appDataFolder&fields=files(id,name)", token);
+        if (list?.files?.[0]?.id) {
+          const json = await googleApi(`/drive/v3/files/${list.files[0].id}?alt=media`, token);
+          if (json && Object.keys(json).length) await chrome.storage.sync.set({ sharedLibraryPayload: json });
         }
+        const { sharedLibraryPayload } = await chrome.storage.sync.get(["sharedLibraryPayload"]);
+        const shared = sharedLibraryPayload?.library || [];
+        const merged = mergeLibraries(library, shared);
+        await saveLibrary(merged);
+        sendResponse({ ok: true, count: merged.length, resolved: library.length + shared.length - merged.length });
+      } catch (error) {
+        sendResponse({ ok: false, error: error.message });
       }
-      const { sharedLibraryPayload } = await chrome.storage.sync.get(["sharedLibraryPayload"]);
-      const shared = sharedLibraryPayload?.library || [];
-      const merged = mergeLibraries(library, shared);
-      await saveLibrary(merged);
-      sendResponse({ ok: true, count: merged.length, resolved: library.length + shared.length - merged.length });
       return;
     }
 
