@@ -164,6 +164,40 @@ function parseDocIdFromUrl(url = "") {
   return match?.[1] || "";
 }
 
+async function ingestAndBuildForDoc({ docId, docName, library, librariesByDoc }) {
+  const docKey = docId || "default-doc";
+  const scopedLibrary = librariesByDoc?.[docKey]?.library || library;
+  let workingLibrary = [...scopedLibrary];
+  let imported = 0;
+  const failed = [];
+  const replacements = [];
+
+  const token = await getAuthToken(true);
+  const docText = await loadDocPlainText(docId, token);
+  const incomingGroups = extractTokenGroupsFromText(docText);
+
+  for (const group of incomingGroups) {
+    const mode = (group.label || "").toLowerCase() === "pmid" ? "pmid" : "doi";
+    const ids = (group.ids || []).map((x) => normalizeIdentifier(mode === "pmid" ? String(x).replace(/^PMID:/i, "") : x)).filter(Boolean);
+    const citationIndexes = [];
+    for (const id of ids) {
+      try {
+        const result = await upsertIdentifier(mode, id, workingLibrary);
+        workingLibrary = result.library;
+        if (result.imported) imported += 1;
+        if (result.record) citationIndexes.push(workingLibrary.indexOf(result.record) + 1);
+      } catch (error) {
+        failed.push({ id, error: error.message });
+      }
+    }
+    const key = `${mode === "pmid" ? "PMID" : "DOI"}|${ids.join(";")}`;
+    replacements.push({ key, display: formatCitationField(citationIndexes), rawToken: group.rawToken || "" });
+  }
+
+  await saveLibraryForDoc(docKey, docName || "Google Doc", workingLibrary, librariesByDoc);
+  return { replacements, imported, failed, foundGroups: incomingGroups.length, docKey };
+}
+
 async function getAuthToken(interactive = false) {
   const { oauthAccessToken, oauthTokenExpiresAt = 0, oauthClientId = "" } = await chrome.storage.local.get(["oauthAccessToken", "oauthTokenExpiresAt", "oauthClientId"]);
   if (oauthAccessToken && Date.now() < oauthTokenExpiresAt - 60_000 && await tokenHasRequiredScopes(oauthAccessToken)) return oauthAccessToken;
@@ -360,7 +394,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           }
         }));
         const scoped = (librariesByDoc?.[docId]?.library || library);
-        const references = scoped.map((rec, i) => `${i + 1}. ${formatCitation(rec, citationStyle)}`).join("\n");
+        const citedDisplays = new Set(tokenReplacements.map((r) => String(r.display || "")).filter(Boolean));
+        const citedIndices = [...citedDisplays]
+          .flatMap((d) => d.split(/[,-]/).map((n) => Number(n.trim())).filter((n) => Number.isInteger(n) && n > 0));
+        const uniqueIndices = [...new Set(citedIndices)].sort((a, b) => a - b);
+        const references = uniqueIndices.map((idx) => {
+          const rec = scoped[idx - 1];
+          return rec ? `${idx}. ${formatCitation(rec, citationStyle)}` : "";
+        }).filter(Boolean).join("\n");
+        if (!references) {
+          sendResponse({ ok: true, skipped: true });
+          return;
+        }
         const marker = "References (RefManager)";
         const docMeta = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
         const endIndex = docMeta?.body?.content?.[docMeta.body.content.length - 1]?.endIndex || 1;
@@ -446,6 +491,26 @@ ${references}
 
       await saveLibraryForDoc(docKey, docName, workingLibrary, librariesByDoc);
       sendResponse({ ok: true, replacements, imported, failed, docKey, docName, foundGroups: incomingGroups.length, fallbackError });
+      return;
+    }
+
+    if (message?.type === "convertDocById") {
+      try {
+        const docId = (message.docId || "").trim();
+        if (!docId) throw new Error("Missing Google Doc ID.");
+        const built = await ingestAndBuildForDoc({ docId, docName: `Manual Doc ${docId.slice(0, 8)}...`, library, librariesByDoc });
+        const tokenReplacements = (built.replacements || []).filter((r) => r.rawToken).map((r) => ({ rawToken: r.rawToken, display: r.display }));
+        await new Promise((resolve, reject) => {
+          chrome.runtime.sendMessage({ type: "applyDocCitationsAndReferences", docId: built.docKey, tokenReplacements }, (res) => {
+            if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+            if (!res?.ok) return reject(new Error(res?.error || "Failed to apply citations to document."));
+            resolve();
+          });
+        });
+        sendResponse({ ok: true, replacedCount: tokenReplacements.length, imported: built.imported, failed: built.failed });
+      } catch (error) {
+        sendResponse({ ok: false, error: error.message || "Document conversion failed." });
+      }
       return;
     }
 
