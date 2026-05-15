@@ -195,7 +195,40 @@ async function ingestAndBuildForDoc({ docId, docName, library, librariesByDoc })
   }
 
   await saveLibraryForDoc(docKey, docName || "Google Doc", workingLibrary, librariesByDoc);
-  return { replacements, imported, failed, foundGroups: incomingGroups.length, docKey };
+  return { replacements, imported, failed, foundGroups: incomingGroups.length, docKey, workingLibrary };
+}
+
+async function applyDocCitationsAndReferencesForLibrary({ docId, tokenReplacements, citationStyle, scopedLibrary }) {
+  const token = await getAuthToken(true);
+  const replaceRequests = tokenReplacements.map((r) => ({
+    replaceAllText: {
+      containsText: { text: r.rawToken, matchCase: true },
+      replaceText: `[${r.display}]`
+    }
+  }));
+  const citedDisplays = new Set(tokenReplacements.map((r) => String(r.display || "")).filter(Boolean));
+  const citedIndices = [...citedDisplays]
+    .flatMap((d) => d.split(/[,-]/).map((n) => Number(n.trim())).filter((n) => Number.isInteger(n) && n > 0));
+  const uniqueIndices = [...new Set(citedIndices)].sort((a, b) => a - b);
+  const references = uniqueIndices.map((idx) => {
+    const rec = scopedLibrary[idx - 1];
+    return rec ? `${idx}. ${formatCitation(rec, citationStyle)}` : "";
+  }).filter(Boolean).join("\n");
+  if (!replaceRequests.length && !references) return { ok: true, skipped: true };
+  const marker = "References (RefManager)";
+  const docMeta = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
+  const endIndex = docMeta?.body?.content?.[docMeta.body.content.length - 1]?.endIndex || 1;
+  const requests = [...replaceRequests];
+  if (references) {
+    requests.push({
+      insertText: {
+        location: { index: Math.max(1, endIndex - 1) },
+        text: `\n\n${marker}\n${references}\n`
+      }
+    });
+  }
+  await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}:batchUpdate`, token, "POST", { requests });
+  return { ok: true };
 }
 
 async function getAuthToken(interactive = false) {
@@ -385,38 +418,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       try {
         const docId = (message.docId || "").trim();
         if (!docId) throw new Error("Missing docId for Docs update.");
-        const token = await getAuthToken(true);
         const tokenReplacements = Array.isArray(message.tokenReplacements) ? message.tokenReplacements : [];
-        const replaceRequests = tokenReplacements.map((r) => ({
-          replaceAllText: {
-            containsText: { text: r.rawToken, matchCase: true },
-            replaceText: `[${r.display}]`
-          }
-        }));
         const scoped = (librariesByDoc?.[docId]?.library || library);
-        const citedDisplays = new Set(tokenReplacements.map((r) => String(r.display || "")).filter(Boolean));
-        const citedIndices = [...citedDisplays]
-          .flatMap((d) => d.split(/[,-]/).map((n) => Number(n.trim())).filter((n) => Number.isInteger(n) && n > 0));
-        const uniqueIndices = [...new Set(citedIndices)].sort((a, b) => a - b);
-        const references = uniqueIndices.map((idx) => {
-          const rec = scoped[idx - 1];
-          return rec ? `${idx}. ${formatCitation(rec, citationStyle)}` : "";
-        }).filter(Boolean).join("\n");
-        if (!references) {
-          sendResponse({ ok: true, skipped: true });
-          return;
-        }
-        const marker = "References (RefManager)";
-        const docMeta = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
-        const endIndex = docMeta?.body?.content?.[docMeta.body.content.length - 1]?.endIndex || 1;
-        const insertText = `
-
-${marker}
-${references}
-`;
-        const requests = [...replaceRequests, { insertText: { location: { index: Math.max(1, endIndex - 1) }, text: insertText } }];
-        await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}:batchUpdate`, token, "POST", { requests });
-        sendResponse({ ok: true });
+        const result = await applyDocCitationsAndReferencesForLibrary({ docId, tokenReplacements, citationStyle, scopedLibrary: scoped });
+        sendResponse(result);
       } catch (error) {
         sendResponse({ ok: false, error: error.message });
       }
@@ -500,13 +505,8 @@ ${references}
         if (!docId) throw new Error("Missing Google Doc ID.");
         const built = await ingestAndBuildForDoc({ docId, docName: `Manual Doc ${docId.slice(0, 8)}...`, library, librariesByDoc });
         const tokenReplacements = (built.replacements || []).filter((r) => r.rawToken).map((r) => ({ rawToken: r.rawToken, display: r.display }));
-        await new Promise((resolve, reject) => {
-          chrome.runtime.sendMessage({ type: "applyDocCitationsAndReferences", docId: built.docKey, tokenReplacements }, (res) => {
-            if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
-            if (!res?.ok) return reject(new Error(res?.error || "Failed to apply citations to document."));
-            resolve();
-          });
-        });
+        if (!built.foundGroups) throw new Error("No DOI/PMID token groups were found in this Google Doc.");
+        await applyDocCitationsAndReferencesForLibrary({ docId: built.docKey, tokenReplacements, citationStyle, scopedLibrary: built.workingLibrary });
         sendResponse({ ok: true, replacedCount: tokenReplacements.length, imported: built.imported, failed: built.failed });
       } catch (error) {
         sendResponse({ ok: false, error: error.message || "Document conversion failed." });

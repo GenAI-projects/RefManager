@@ -35,21 +35,6 @@ async function refreshLinkedDocFromActiveTab() {
 }
 
 
-async function findDocTabById(docId) {
-  const tabs = await chrome.tabs.query({});
-  return tabs.find((t) => parseDoc(t.url || "") === docId) || null;
-}
-
-async function ensureContentScript(tab) {
-  try {
-    await chrome.tabs.sendMessage(tab.id, { type: "pingRefManager" });
-    return true;
-  } catch (_err) {
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["src/content.js"] });
-    return true;
-  }
-}
-
 document.getElementById("convert-current").addEventListener("click", async () => {
   const tab = await getActiveTab();
   if (!tab?.id) return;
@@ -58,38 +43,15 @@ document.getElementById("convert-current").addEventListener("click", async () =>
     statusEl.textContent = "Open a Google Doc tab first, or enter Manual Google Doc ID.";
     return;
   }
-
-  const targetTab = parseDoc(tab.url || "") ? tab : await findDocTabById(activeDocId);
-  if (!targetTab?.id) {
-    chrome.runtime.sendMessage({ type: "convertDocById", docId: activeDocId }, (response) => {
-      if (chrome.runtime.lastError) {
-        statusEl.textContent = `Could not convert this document: ${chrome.runtime.lastError.message}`;
-        return;
-      }
-      statusEl.textContent = response?.ok
-        ? `Converted ${response.replacedCount || 0} token group(s). Imported ${response.imported || 0} new reference(s).`
-        : `Could not convert this document: ${response?.error || "Unknown error"}`;
-    });
-    return;
-  }
-
-  try {
-    if (!parseDoc(tab.url || "")) {
-      statusEl.textContent = "Using manual Doc ID fallback with a matching open Google Doc tab.";
+  chrome.runtime.sendMessage({ type: "convertDocById", docId: activeDocId }, (response) => {
+    if (chrome.runtime.lastError) {
+      statusEl.textContent = `Could not convert this document: ${chrome.runtime.lastError.message}`;
+      return;
     }
-    await ensureContentScript(targetTab);
-    chrome.tabs.sendMessage(targetTab.id, { type: "convertDocTokens" }, (response) => {
-      if (chrome.runtime.lastError) {
-        statusEl.textContent = `Could not convert in this tab: ${chrome.runtime.lastError.message}`;
-        return;
-      }
-      statusEl.textContent = response?.ok
-        ? `Converted ${response.replacedCount || 0} token group(s). Imported ${response.imported || 0} new reference(s).`
-        : `Could not convert in this tab: ${response?.error || "Unknown error"}`;
-    });
-  } catch (error) {
-    statusEl.textContent = `Could not convert in this tab: ${error.message}`;
-  }
+    statusEl.textContent = response?.ok
+      ? `Converted ${response.replacedCount || 0} token group(s). Imported ${response.imported || 0} new reference(s).`
+      : `Could not convert this document: ${response?.error || "Unknown error"}`;
+  });
 });
 
 document.getElementById("link-current").addEventListener("click", async () => {
