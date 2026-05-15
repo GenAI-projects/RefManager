@@ -582,7 +582,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         const raw = error?.message || "Document conversion failed.";
         if (raw.includes("/docs/v1/documents/") && raw.includes("failed: 404")) {
           const diagnostic = await diagnoseDocAccess((message.docId || "").trim());
-          sendResponse({ ok: false, error: `${raw}. ${diagnostic}` });
+          sendResponse({ ok: false, error: `${raw}. ${diagnostic} Library import is skipped in this path because token ingestion reads the Doc through the Docs API first.` });
           return;
         }
         sendResponse({ ok: false, error: raw });
