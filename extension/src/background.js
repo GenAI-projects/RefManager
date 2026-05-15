@@ -1,5 +1,6 @@
 const DOI_PATTERN = /^10\.\d{4,9}\/\S+$/i;
 const PMID_PATTERN = /^\d{1,10}$/;
+const DOI_URL_PREFIX_PATTERN = /^https?:\/\/(?:dx\.)?doi\.org\//i;
 
 const REQUIRED_SCOPES = [
   "https://www.googleapis.com/auth/drive.appdata",
@@ -40,6 +41,12 @@ function normalizeIdentifier(value) {
   return String(value || "").trim().replace(/\s+/g, "");
 }
 
+function normalizeDoiCandidate(value) {
+  const raw = normalizeIdentifier(value);
+  if (!raw) return "";
+  return raw.replace(DOI_URL_PREFIX_PATTERN, "");
+}
+
 function formatCitationField(indices) {
   if (!indices.length) return "";
   const sorted = [...new Set(indices)].sort((a, b) => a - b);
@@ -48,7 +55,7 @@ function formatCitationField(indices) {
 }
 
 async function upsertIdentifier(mode, rawValue, currentLibrary) {
-  const raw = normalizeIdentifier(rawValue);
+  const raw = mode === "doi" ? normalizeDoiCandidate(rawValue) : normalizeIdentifier(rawValue);
   if (!raw) return { record: null, library: currentLibrary, imported: false };
   if (mode === "doi") {
     if (!DOI_PATTERN.test(raw)) throw new Error(`Invalid DOI format: ${raw}`);
@@ -135,14 +142,34 @@ function formatCitation(record, style) {
 
 function extractTokenGroupsFromText(text = "") {
   const groups = [];
-  const doiPattern = /\{([^{}]*10\.\d{4,9}\/[\-._;()/:A-Z0-9]+[^{}]*)\}/gi;
+  const doiPattern = /\{([^{}]*(?:10\.\d{4,9}\/\S+|https?:\/\/(?:dx\.)?doi\.org\/\S+)[^{}]*)\}/gi;
   const pmidPattern = /\{([^{}]*PMID:\s*\d+[^{}]*)\}/gi;
+  const doiUrlPattern = /\{([^{}]*DOI_URL[^{}]*)\}/gi;
+  const pmidUrlPattern = /\{([^{}]*PMID_URL[^{}]*)\}/gi;
   let match;
   while ((match = doiPattern.exec(text)) !== null) {
-    groups.push({ label: "DOI", ids: match[1].split(";").map((x) => x.trim()).filter((x) => x && x.includes("/")), rawToken: match[0] });
+    const ids = match[1].split(/[;:]/).map((x) => normalizeDoiCandidate(x)).filter((x) => DOI_PATTERN.test(x));
+    if (ids.length) groups.push({ label: "DOI", ids, rawToken: match[0] });
   }
   while ((match = pmidPattern.exec(text)) !== null) {
     groups.push({ label: "PMID", ids: match[1].split(";").map((x) => x.replace(/PMID:\s*/gi, "").trim()).filter(Boolean), rawToken: match[0] });
+  }
+  while ((match = doiUrlPattern.exec(text)) !== null) {
+    const ids = match[1]
+      .split(":")
+      .map((x) => x.replace(/DOI_URL\s*\d*\s*/gi, "").trim())
+      .map((x) => normalizeDoiCandidate(x))
+      .filter((x) => DOI_PATTERN.test(x));
+    if (ids.length) groups.push({ label: "DOI", ids, rawToken: match[0] });
+  }
+  while ((match = pmidUrlPattern.exec(text)) !== null) {
+    const ids = match[1]
+      .split(":")
+      .map((x) => x.replace(/PMID_URL\s*\d*\s*/gi, "").trim())
+      .map((x) => x.replace(/^https?:\/\/pubmed\.ncbi\.nlm\.nih\.gov\//i, ""))
+      .map((x) => x.replace(/\/$/, ""))
+      .filter((x) => PMID_PATTERN.test(x));
+    if (ids.length) groups.push({ label: "PMID", ids, rawToken: match[0] });
   }
   return groups;
 }
@@ -311,7 +338,13 @@ async function googleApi(path, token, method = "GET", body, headers = {}) {
     throw new Error(`Google API ${method} ${path} failed: ${response.status}${details}`);
   }
   if (response.status === 204) return {};
-  return response.json();
+  const text = await response.text();
+  if (!text || !text.trim()) return {};
+  try {
+    return JSON.parse(text);
+  } catch (_error) {
+    throw new Error(`Google API ${method} ${path} returned non-JSON response.`);
+  }
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
