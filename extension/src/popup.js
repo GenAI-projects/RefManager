@@ -4,7 +4,7 @@ const linkedDocEl = document.getElementById("linked-doc");
 const manualDocIdInput = document.getElementById("manual-doc-id");
 
 function parseDoc(url = "") {
-  const match = url.match(/https:\/\/docs\.google\.com\/document\/(?:u\/\d+\/)?d\/([^/?#]+)/);
+  const match = String(url).match(/(?:https?:\/\/)?docs\.google\.com\/document\/(?:u\/\d+\/)?d\/([^/?#]+)/i);
   return match?.[1] || null;
 }
 
@@ -61,7 +61,15 @@ document.getElementById("convert-current").addEventListener("click", async () =>
 
   const targetTab = parseDoc(tab.url || "") ? tab : await findDocTabById(activeDocId);
   if (!targetTab?.id) {
-    statusEl.textContent = "Could not find an open tab for that Doc ID. Open the target Google Doc tab and try again.";
+    chrome.runtime.sendMessage({ type: "convertDocById", docId: activeDocId }, (response) => {
+      if (chrome.runtime.lastError) {
+        statusEl.textContent = `Could not convert this document: ${chrome.runtime.lastError.message}`;
+        return;
+      }
+      statusEl.textContent = response?.ok
+        ? `Converted ${response.replacedCount || 0} token group(s). Imported ${response.imported || 0} new reference(s).`
+        : `Could not convert this document: ${response?.error || "Unknown error"}`;
+    });
     return;
   }
 
