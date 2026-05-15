@@ -43,6 +43,25 @@ document.getElementById("convert-current").addEventListener("click", async () =>
     statusEl.textContent = "Open a Google Doc tab first, or enter Manual Google Doc ID.";
     return;
   }
+  const onDocsTab = Boolean(parseDoc(tab.url || ""));
+  if (onDocsTab) {
+    chrome.tabs.sendMessage(tab.id, { type: "convertDocTokens" }, (response) => {
+      if (chrome.runtime.lastError) {
+        // Fallback for cases where the content script is not injected yet.
+        chrome.runtime.sendMessage({ type: "convertDocById", docId: activeDocId }, (fallback) => {
+          statusEl.textContent = fallback?.ok
+            ? `Converted ${fallback.replacedCount || 0} token group(s). Imported ${fallback.imported || 0} new reference(s).`
+            : `Could not convert this document: ${fallback?.error || chrome.runtime.lastError.message || "Unknown error"}`;
+        });
+        return;
+      }
+      statusEl.textContent = response?.ok
+        ? `Converted ${response.replacedCount || 0} token group(s). Imported ${response.imported || 0} new reference(s).`
+        : `Could not convert this document: ${response?.error || "Unknown error"}`;
+    });
+    return;
+  }
+
   chrome.runtime.sendMessage({ type: "convertDocById", docId: activeDocId }, (response) => {
     if (chrome.runtime.lastError) {
       statusEl.textContent = `Could not convert this document: ${chrome.runtime.lastError.message}`;
