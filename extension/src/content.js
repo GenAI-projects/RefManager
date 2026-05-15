@@ -110,7 +110,7 @@ function convertDocTokensWithAutoLookup(sendResponse) {
       const replacedCount = processEditableRoots(replacements);
       refreshCitationSpanOrder();
       const tokenReplacements = (response.replacements || []).filter((r) => r.rawToken).map((r) => ({ rawToken: r.rawToken, display: r.display }));
-      chrome.runtime.sendMessage({ type: "applyDocCitationsAndReferences", docId: getDocContext().docId, tokenReplacements }, () => {});
+      chrome.runtime.sendMessage({ type: "applyDocCitationsAndReferences", docId: response?.docKey || getDocContext().docId, tokenReplacements }, () => {});
       if (!replacedCount && !response?.foundGroups) {
         const fallbackHint = response?.fallbackError ? ` Fallback details: ${response.fallbackError}` : "";
         return sendResponse({ ok: false, error: `No DOI/PMID token groups were found to replace. Found groups: ${(collectTokenGroups() || []).length}.${fallbackHint}` });

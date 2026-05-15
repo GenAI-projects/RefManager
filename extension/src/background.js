@@ -159,6 +159,11 @@ async function loadDocPlainText(docId, token) {
   return pieces.join("");
 }
 
+function parseDocIdFromUrl(url = "") {
+  const match = String(url).match(/\/document\/(?:u\/\d+\/)?d\/([^/?#]+)/);
+  return match?.[1] || "";
+}
+
 async function getAuthToken(interactive = false) {
   const { oauthAccessToken, oauthTokenExpiresAt = 0, oauthClientId = "" } = await chrome.storage.local.get(["oauthAccessToken", "oauthTokenExpiresAt", "oauthClientId"]);
   if (oauthAccessToken && Date.now() < oauthTokenExpiresAt - 60_000 && await tokenHasRequiredScopes(oauthAccessToken)) return oauthAccessToken;
@@ -398,15 +403,25 @@ ${references}
 
       let incomingGroups = Array.isArray(message.groups) ? message.groups : [];
       let fallbackError = "";
-      if (!incomingGroups.length && message.docId) {
-        try {
-          const token = await getAuthToken(true);
-          const docText = await loadDocPlainText(message.docId, token);
-          incomingGroups = extractTokenGroupsFromText(docText);
-        } catch (error) {
-          fallbackError = error?.message || "Docs API fallback failed.";
-          incomingGroups = [];
+      if (!incomingGroups.length) {
+        const candidates = [];
+        if (message.docId) candidates.push(message.docId);
+        if (docKey && !candidates.includes(docKey)) candidates.push(docKey);
+        const linkedUrlId = parseDocIdFromUrl(librariesByDoc?.[docKey]?.url || "");
+        if (linkedUrlId && !candidates.includes(linkedUrlId)) candidates.push(linkedUrlId);
+
+        let lastError = "";
+        for (const candidateDocId of candidates) {
+          try {
+            const token = await getAuthToken(true);
+            const docText = await loadDocPlainText(candidateDocId, token);
+            incomingGroups = extractTokenGroupsFromText(docText);
+            if (incomingGroups.length) break;
+          } catch (error) {
+            lastError = error?.message || "Docs API fallback failed.";
+          }
         }
+        fallbackError = lastError;
       }
 
       for (const group of incomingGroups) {
