@@ -1,6 +1,26 @@
 const DOI_PATTERN = /^10\.\d{4,9}\/[-._;()/:A-Z0-9]+$/i;
 const PMID_PATTERN = /^\d{1,10}$/;
 
+const REQUIRED_SCOPES = [
+  "https://www.googleapis.com/auth/drive.appdata",
+  "https://www.googleapis.com/auth/drive.file",
+  "https://www.googleapis.com/auth/drive.metadata.readonly",
+  "https://www.googleapis.com/auth/userinfo.email",
+  "https://www.googleapis.com/auth/documents"
+];
+
+async function tokenHasRequiredScopes(token) {
+  try {
+    const res = await fetch(`https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=${encodeURIComponent(token)}`);
+    if (!res.ok) return false;
+    const payload = await res.json();
+    const granted = new Set(String(payload.scope || "").split(/\s+/).filter(Boolean));
+    return REQUIRED_SCOPES.every((scope) => granted.has(scope));
+  } catch (_error) {
+    return false;
+  }
+}
+
 async function getLibrary() {
   const { library = [], citationStyle = "apa", librariesByDoc = {}, activeDocKey = null } = await chrome.storage.local.get(["library", "citationStyle", "librariesByDoc", "activeDocKey"]);
   return { library, citationStyle, librariesByDoc, activeDocKey };
@@ -113,24 +133,51 @@ function formatCitation(record, style) {
   return `${authors} (${record.year}). ${record.title}. ${record.journal}.`;
 }
 
+function extractTokenGroupsFromText(text = "") {
+  const groups = [];
+  const doiPattern = /\{([^{}]*10\.\d{4,9}\/[\-._;()/:A-Z0-9]+[^{}]*)\}/gi;
+  const pmidPattern = /\{([^{}]*PMID:\s*\d+[^{}]*)\}/gi;
+  let match;
+  while ((match = doiPattern.exec(text)) !== null) {
+    groups.push({ label: "DOI", ids: match[1].split(";").map((x) => x.trim()).filter((x) => x && x.includes("/")), rawToken: match[0] });
+  }
+  while ((match = pmidPattern.exec(text)) !== null) {
+    groups.push({ label: "PMID", ids: match[1].split(";").map((x) => x.replace(/PMID:\s*/gi, "").trim()).filter(Boolean), rawToken: match[0] });
+  }
+  return groups;
+}
+
+async function loadDocPlainText(docId, token) {
+  const doc = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
+  const pieces = [];
+  for (const item of (doc?.body?.content || [])) {
+    const elements = item?.paragraph?.elements || [];
+    for (const el of elements) {
+      if (el?.textRun?.content) pieces.push(el.textRun.content);
+    }
+  }
+  return pieces.join("");
+}
+
+function parseDocIdFromUrl(url = "") {
+  const match = String(url).match(/\/document\/(?:u\/\d+\/)?d\/([^/?#]+)/);
+  return match?.[1] || "";
+}
+
 async function getAuthToken(interactive = false) {
   const { oauthAccessToken, oauthTokenExpiresAt = 0, oauthClientId = "" } = await chrome.storage.local.get(["oauthAccessToken", "oauthTokenExpiresAt", "oauthClientId"]);
-  if (oauthAccessToken && Date.now() < oauthTokenExpiresAt - 60_000) return oauthAccessToken;
+  if (oauthAccessToken && Date.now() < oauthTokenExpiresAt - 60_000 && await tokenHasRequiredScopes(oauthAccessToken)) return oauthAccessToken;
   if (!interactive) throw new Error("Authentication required.");
   if (!oauthClientId) throw new Error("Google OAuth Client ID is not configured. Set it on the landing page.");
 
   const redirectUri = chrome.identity.getRedirectURL();
-  const scopes = [
-    "https://www.googleapis.com/auth/drive.appdata",
-    "https://www.googleapis.com/auth/drive.file",
-    "https://www.googleapis.com/auth/drive.metadata.readonly",
-    "https://www.googleapis.com/auth/userinfo.email"
-  ].join(" ");
-  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(oauthClientId)}&response_type=token&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scopes)}&prompt=consent`;
+  const scopes = REQUIRED_SCOPES.join(" ");
+  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(oauthClientId)}&response_type=token&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scopes)}&include_granted_scopes=true&prompt=consent`;
   const finalUrl = await new Promise((resolve, reject) => {
     chrome.identity.launchWebAuthFlow({ url: authUrl, interactive: true }, (url) => {
       if (chrome.runtime.lastError || !url) {
-        reject(new Error(chrome.runtime.lastError?.message || "OAuth flow failed."));
+        const launchError = chrome.runtime.lastError?.message || "OAuth flow failed.";
+        reject(new Error(`${launchError} Expected redirect URI: ${redirectUri}. OAuth client ID: ${oauthClientId}`));
         return;
       }
       resolve(url);
@@ -156,7 +203,14 @@ async function googleApi(path, token, method = "GET", body, headers = {}) {
     },
     body: body ? JSON.stringify(body) : undefined
   });
-  if (!response.ok) throw new Error(`Google API ${method} ${path} failed: ${response.status}`);
+  if (!response.ok) {
+    let details = "";
+    try {
+      const err = await response.json();
+      details = err?.error?.message ? ` - ${err.error.message}` : "";
+    } catch (_error) {}
+    throw new Error(`Google API ${method} ${path} failed: ${response.status}${details}`);
+  }
   if (response.status === 204) return {};
   return response.json();
 }
@@ -182,7 +236,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         await saveLibrary([...library, record]);
         sendResponse({ ok: true, record });
       } catch (error) {
-        sendResponse({ ok: false, error: error.message });
+        sendResponse({ ok: false, error: `${error.message}. If this is 403, re-login with consent and ensure Drive API is enabled for this OAuth project.` });
       }
       return;
     }
@@ -270,6 +324,60 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return;
     }
 
+    if (message?.type === "linkCurrentDoc") {
+      const docId = (message.docId || '').trim();
+      if (!docId) {
+        sendResponse({ ok: false, error: 'Missing Google Doc ID.' });
+        return;
+      }
+      let docName = (message.docName || 'Google Doc').replace(/\s+-\s+Google Docs\s*$/i, '').trim();
+      if (!docName || /^Manual Doc\b/i.test(docName)) {
+        try {
+          const token = await getAuthToken(false);
+          const fileMeta = await googleApi(`/drive/v3/files/${encodeURIComponent(docId)}?fields=id,name,mimeType`, token);
+          if (fileMeta?.name) docName = fileMeta.name;
+        } catch (_error) {
+          // best effort; keep provided name when metadata lookup is unavailable
+        }
+      }
+      const updated = { ...(librariesByDoc || {}) };
+      updated[docId] = { docName, library: updated[docId]?.library || library, updatedAt: new Date().toISOString(), url: message.url || '' };
+      await chrome.storage.local.set({ librariesByDoc: updated, activeDocKey: docId });
+      sendResponse({ ok: true, docId, docName });
+      return;
+    }
+
+    if (message?.type === "applyDocCitationsAndReferences") {
+      try {
+        const docId = (message.docId || "").trim();
+        if (!docId) throw new Error("Missing docId for Docs update.");
+        const token = await getAuthToken(true);
+        const tokenReplacements = Array.isArray(message.tokenReplacements) ? message.tokenReplacements : [];
+        const replaceRequests = tokenReplacements.map((r) => ({
+          replaceAllText: {
+            containsText: { text: r.rawToken, matchCase: true },
+            replaceText: `[${r.display}]`
+          }
+        }));
+        const scoped = (librariesByDoc?.[docId]?.library || library);
+        const references = scoped.map((rec, i) => `${i + 1}. ${formatCitation(rec, citationStyle)}`).join("\n");
+        const marker = "References (RefManager)";
+        const docMeta = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
+        const endIndex = docMeta?.body?.content?.[docMeta.body.content.length - 1]?.endIndex || 1;
+        const insertText = `
+
+${marker}
+${references}
+`;
+        const requests = [...replaceRequests, { insertText: { location: { index: Math.max(1, endIndex - 1) }, text: insertText } }];
+        await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}:batchUpdate`, token, "POST", { requests });
+        sendResponse({ ok: true });
+      } catch (error) {
+        sendResponse({ ok: false, error: error.message });
+      }
+      return;
+    }
+
     if (message?.type === "mergeDuplicates") {
       const seen = new Map();
       const merged = [];
@@ -293,7 +401,30 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       const failed = [];
       const replacements = [];
 
-      for (const group of (message.groups || [])) {
+      let incomingGroups = Array.isArray(message.groups) ? message.groups : [];
+      let fallbackError = "";
+      if (!incomingGroups.length) {
+        const candidates = [];
+        if (message.docId) candidates.push(message.docId);
+        if (docKey && !candidates.includes(docKey)) candidates.push(docKey);
+        const linkedUrlId = parseDocIdFromUrl(librariesByDoc?.[docKey]?.url || "");
+        if (linkedUrlId && !candidates.includes(linkedUrlId)) candidates.push(linkedUrlId);
+
+        let lastError = "";
+        for (const candidateDocId of candidates) {
+          try {
+            const token = await getAuthToken(true);
+            const docText = await loadDocPlainText(candidateDocId, token);
+            incomingGroups = extractTokenGroupsFromText(docText);
+            if (incomingGroups.length) break;
+          } catch (error) {
+            lastError = error?.message || "Docs API fallback failed.";
+          }
+        }
+        fallbackError = lastError;
+      }
+
+      for (const group of incomingGroups) {
         const mode = (group.label || "").toLowerCase() === "pmid" ? "pmid" : "doi";
         const ids = (group.ids || []).map((x) => normalizeIdentifier(mode === "pmid" ? String(x).replace(/^PMID:/i, "") : x)).filter(Boolean);
         const citationIndexes = [];
@@ -310,11 +441,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         }
 
         const key = `${mode === "pmid" ? "PMID" : "DOI"}|${ids.join(";")}`;
-        replacements.push({ key, display: formatCitationField(citationIndexes) });
+        replacements.push({ key, display: formatCitationField(citationIndexes), rawToken: group.rawToken || "" });
       }
 
       await saveLibraryForDoc(docKey, docName, workingLibrary, librariesByDoc);
-      sendResponse({ ok: true, replacements, imported, failed, docKey, docName });
+      sendResponse({ ok: true, replacements, imported, failed, docKey, docName, foundGroups: incomingGroups.length, fallbackError });
       return;
     }
 
