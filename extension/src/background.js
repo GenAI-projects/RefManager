@@ -198,6 +198,38 @@ async function ingestAndBuildForDoc({ docId, docName, library, librariesByDoc })
   return { replacements, imported, failed, foundGroups: incomingGroups.length, docKey, workingLibrary };
 }
 
+async function getAuthenticatedProfileEmail() {
+  try {
+    const token = await getAuthToken(false);
+    const profile = await googleApi("/oauth2/v2/userinfo", token);
+    return profile?.email || "unknown-account";
+  } catch (_error) {
+    return "unknown-account";
+  }
+}
+
+async function diagnoseDocAccess(docId) {
+  const token = await getAuthToken(true);
+  const encoded = encodeURIComponent(docId);
+  const authEmail = await getAuthenticatedProfileEmail();
+  try {
+    const fileMeta = await googleApi(`/drive/v3/files/${encoded}?fields=id,name,mimeType,owners(emailAddress)&supportsAllDrives=true`, token);
+    if (fileMeta?.mimeType !== "application/vnd.google-apps.document") {
+      return `ID resolves, but it is not a Google Doc (mimeType=${fileMeta?.mimeType || "unknown"}).`;
+    }
+    return `Drive can see this Doc as \"${fileMeta?.name || docId}\" for ${authEmail}. If Docs API still fails, re-login and verify the OAuth client belongs to the same Google account.`;
+  } catch (error) {
+    const msg = String(error?.message || "");
+    if (msg.includes("failed: 404")) {
+      return `Drive cannot find this Doc ID for ${authEmail} (404). Common causes: wrong Doc ID, Doc belongs to a different Google account, or the Doc is not shared with the authenticated account.`;
+    }
+    if (msg.includes("failed: 403")) {
+      return `Drive access is forbidden (403) for ${authEmail}. Re-run Google login consent and ensure Drive API + Google Docs API are enabled for this OAuth client.`;
+    }
+    return `Drive access check failed for ${authEmail}: ${msg || "unknown error"}`;
+  }
+}
+
 async function applyDocCitationsAndReferencesForLibrary({ docId, tokenReplacements, citationStyle, scopedLibrary }) {
   const token = await getAuthToken(true);
   const replaceRequests = tokenReplacements.map((r) => ({
@@ -509,7 +541,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         await applyDocCitationsAndReferencesForLibrary({ docId: built.docKey, tokenReplacements, citationStyle, scopedLibrary: built.workingLibrary });
         sendResponse({ ok: true, replacedCount: tokenReplacements.length, imported: built.imported, failed: built.failed });
       } catch (error) {
-        sendResponse({ ok: false, error: error.message || "Document conversion failed." });
+        const raw = error?.message || "Document conversion failed.";
+        if (raw.includes("/docs/v1/documents/") && raw.includes("failed: 404")) {
+          const diagnostic = await diagnoseDocAccess((message.docId || "").trim());
+          sendResponse({ ok: false, error: `${raw}. ${diagnostic}` });
+          return;
+        }
+        sendResponse({ ok: false, error: raw });
       }
       return;
     }
