@@ -429,58 +429,73 @@ function extractReferenceMarkerRange(doc) {
   return null;
 }
 
-async function applyDocCitationsAndReferencesForLibrary({ docId, tokenReplacements, citationStyle, scopedLibrary }) {
-  const token = await getAuthToken(true);
-  const docMeta = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
-  const endIndex = docMeta?.body?.content?.[docMeta.body.content.length - 1]?.endIndex || 1;
-  const requests = [];
-  const existingReferenceRange = extractReferenceMarkerRange(docMeta);
-  if (existingReferenceRange) {
-    requests.push({ deleteContentRange: { range: existingReferenceRange } });
-  }
+function docEndInsertIndex(doc) {
+  const endIndex = doc?.body?.content?.[doc.body.content.length - 1]?.endIndex || 1;
+  return Math.max(1, endIndex - 1);
+}
 
-  for (const r of tokenReplacements) {
-    if (!r.rawToken || !r.display) continue;
-    requests.push({
-      replaceAllText: {
-        containsText: { text: r.rawToken, matchCase: true },
-        replaceText: `[${r.display}]`
-      }
-    });
-  }
-
-  const citedDisplays = new Set(tokenReplacements.map((r) => String(r.display || "")).filter(Boolean));
-  const citedIndices = [...citedDisplays].flatMap((d) => {
-    if (d.includes("-")) {
-      const [start, end] = d.split("-").map((n) => Number(n.trim()));
-      if (Number.isInteger(start) && Number.isInteger(end) && end >= start) return Array.from({ length: end - start + 1 }, (_x, i) => start + i);
+function citationIndicesFromDisplay(display) {
+  const value = String(display || "").trim();
+  if (!value) return [];
+  if (value.includes("-")) {
+    const [start, end] = value.split("-").map((n) => Number(n.trim()));
+    if (Number.isInteger(start) && Number.isInteger(end) && end >= start) {
+      return Array.from({ length: end - start + 1 }, (_x, i) => start + i);
     }
-    return d.split(",").map((n) => Number(n.trim())).filter((n) => Number.isInteger(n) && n > 0);
-  });
+  }
+  return value.split(",").map((n) => Number(n.trim())).filter((n) => Number.isInteger(n) && n > 0);
+}
+
+function buildReferencesText(tokenReplacements, scopedLibrary, citationStyle) {
+  const citedDisplays = new Set(tokenReplacements.map((r) => String(r.display || "")).filter(Boolean));
+  const citedIndices = [...citedDisplays].flatMap(citationIndicesFromDisplay);
   const uniqueIndices = [...new Set(citedIndices)].sort((a, b) => a - b);
   const references = uniqueIndices.map((idx) => {
     const rec = scopedLibrary[idx - 1];
     return rec ? `${idx}. ${formatCitation(rec, citationStyle)} ${paperUrl(rec)}` : "";
   }).filter(Boolean).join("\n");
+  return references ? `\n\n${REFERENCES_MARKER}\n${references}\n` : "";
+}
 
-  if (references) {
-    requests.push({
-      insertText: {
-        location: { index: Math.max(1, existingReferenceRange ? existingReferenceRange.startIndex : endIndex - 1) },
-        text: `\n\n${REFERENCES_MARKER}\n${references}\n`
-      }
+async function applyDocCitationsAndReferencesForLibrary({ docId, tokenReplacements, citationStyle, scopedLibrary }) {
+  const token = await getAuthToken(true);
+  let docMeta = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
+
+  const existingReferenceRange = extractReferenceMarkerRange(docMeta);
+  if (existingReferenceRange) {
+    await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}:batchUpdate`, token, "POST", {
+      requests: [{ deleteContentRange: { range: existingReferenceRange } }]
     });
+    docMeta = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
   }
 
-  if (!requests.length) return { ok: true, skipped: true };
-  await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}:batchUpdate`, token, "POST", { requests });
+  const replaceRequests = tokenReplacements
+    .filter((r) => r.rawToken && r.display)
+    .map((r) => ({
+      replaceAllText: {
+        containsText: { text: r.rawToken, matchCase: true },
+        replaceText: `[${r.display}]`
+      }
+    }));
 
-  const updatedDoc = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
+  if (replaceRequests.length) {
+    await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}:batchUpdate`, token, "POST", { requests: replaceRequests });
+    docMeta = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
+  }
+
+  const referencesText = buildReferencesText(tokenReplacements, scopedLibrary, citationStyle);
+  if (referencesText) {
+    await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}:batchUpdate`, token, "POST", {
+      requests: [{ insertText: { location: { index: docEndInsertIndex(docMeta) }, text: referencesText } }]
+    });
+    docMeta = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
+  }
+
   const styleRequests = [];
   for (const r of tokenReplacements) {
     if (!r.display) continue;
     const citationText = `[${r.display}]`;
-    for (const block of (updatedDoc?.body?.content || [])) {
+    for (const block of (docMeta?.body?.content || [])) {
       for (const el of (block?.paragraph?.elements || [])) {
         const content = el?.textRun?.content || "";
         let idx = content.indexOf(citationText);
@@ -500,7 +515,7 @@ async function applyDocCitationsAndReferencesForLibrary({ docId, tokenReplacemen
     }
   }
   if (styleRequests.length) await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}:batchUpdate`, token, "POST", { requests: styleRequests });
-  return { ok: true, styledCount: styleRequests.length };
+  return { ok: true, replacedCount: replaceRequests.length, referencesInserted: Boolean(referencesText), styledCount: styleRequests.length };
 }
 
 async function getAuthToken(interactive = false) {
