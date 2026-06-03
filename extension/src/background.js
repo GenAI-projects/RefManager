@@ -532,12 +532,16 @@ async function getAuthToken(interactive = false) {
   return token;
 }
 
-function googleApiBaseUrl(path) {
-  return String(path).startsWith("/docs/") ? "https://docs.googleapis.com" : "https://www.googleapis.com";
+function googleApiUrl(path) {
+  const normalizedPath = String(path);
+  if (normalizedPath.startsWith("/docs/v1/")) {
+    return `https://docs.googleapis.com${normalizedPath.replace(/^\/docs/, "")}`;
+  }
+  return `https://www.googleapis.com${normalizedPath}`;
 }
 
 async function googleApi(path, token, method = "GET", body, headers = {}) {
-  const response = await fetch(`${googleApiBaseUrl(path)}${path}`, {
+  const response = await fetch(googleApiUrl(path), {
     method,
     headers: {
       Authorization: `Bearer ${token}`,
