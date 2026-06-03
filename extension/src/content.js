@@ -1,16 +1,43 @@
-const DOI_GROUP_PATTERN = /\{([^{}]*10\.\d{4,9}\/[\-._;()/:A-Z0-9]+[^{}]*)\}/gi;
-const PMID_GROUP_PATTERN = /\{([^{}]*PMID:\s*\d+[^{}]*)\}/gi;
+const TOKEN_PATTERN = /\{[^{}]+\}/g;
+const DOI_PATTERN = /^10\.\d{4,9}\/\S+$/i;
+const PMID_PATTERN = /^\d{1,10}$/;
+const DOI_URL_PREFIX_PATTERN = /^https?:\/\/(?:dx\.)?doi\.org\//i;
 
 function normalizeToken(id) { return String(id || "").trim().replace(/\s+/g, ""); }
+function normalizeDoiCandidate(value) { return normalizeToken(value).replace(DOI_URL_PREFIX_PATTERN, ""); }
 function getDocContext() {
   const match = window.location.pathname.match(/\/document\/(?:u\/\d+\/)?d\/([^/]+)/);
   const docId = match?.[1] || document.title || "default-doc";
   const cleanTitle = (document.title || "Untitled Doc").replace(/\s+-\s+Google Docs\s*$/i, "").trim();
   return { docId, docName: cleanTitle || "Untitled Doc" };
 }
-function parseDoiGroup(group) { return group.split(";").map((x) => x.trim()).filter((x) => x && x.includes("/")); }
-function parsePmidGroup(group) { return group.split(";").map((x) => x.replace(/PMID:\s*/gi, "").trim()).filter(Boolean); }
 
+function parseAllowedTokenGroup(rawToken) {
+  const token = String(rawToken || "").trim();
+  const inner = token.match(/^\{\s*([^{}]+?)\s*\}$/)?.[1];
+  if (!inner) return null;
+  const parts = inner.split(";").map((x) => x.trim()).filter(Boolean);
+  if (!parts.length) return null;
+
+  const parsed = parts.map((part) => {
+    const doiMatch = part.match(/^DOI\s*:\s*(10\.\d{4,9}\/\S+)$/i);
+    if (doiMatch) return { style: "DOI", id: normalizeDoiCandidate(doiMatch[1]) };
+    const doiUrlMatch = part.match(/^(https?:\/\/(?:dx\.)?doi\.org\/10\.\d{4,9}\/\S+)$/i);
+    if (doiUrlMatch) return { style: "DOI_URL", id: normalizeDoiCandidate(doiUrlMatch[1]) };
+    const pmidMatch = part.match(/^PMID\s*:\s*(\d{1,10})$/i);
+    if (pmidMatch) return { style: "PMID", id: normalizeToken(pmidMatch[1]) };
+    return null;
+  });
+
+  if (parsed.some((x) => !x)) return null;
+  const styles = new Set(parsed.map((x) => x.style));
+  if (styles.size !== 1) return null;
+  const style = parsed[0].style;
+  const label = style === "PMID" ? "PMID" : "DOI";
+  const ids = parsed.map((x) => x.id).filter((id) => label === "PMID" ? PMID_PATTERN.test(id) : DOI_PATTERN.test(id));
+  if (ids.length !== parsed.length) return null;
+  return { label, tokenStyle: style, ids, rawToken: token };
+}
 
 function getEditorRoots() {
   const roots = [
@@ -29,41 +56,52 @@ function collectTokenGroups() {
     let current;
     while ((current = walker.nextNode())) {
       const text = current.nodeValue || "";
-      DOI_GROUP_PATTERN.lastIndex = 0;
-      PMID_GROUP_PATTERN.lastIndex = 0;
+      TOKEN_PATTERN.lastIndex = 0;
       let m;
-      while ((m = DOI_GROUP_PATTERN.exec(text)) !== null) groups.push({ label: "DOI", ids: parseDoiGroup(m[1]), rawToken: m[0] });
-      while ((m = PMID_GROUP_PATTERN.exec(text)) !== null) groups.push({ label: "PMID", ids: parsePmidGroup(m[1]), rawToken: m[0] });
+      while ((m = TOKEN_PATTERN.exec(text)) !== null) {
+        const parsed = parseAllowedTokenGroup(m[0]);
+        if (parsed) groups.push(parsed);
+      }
     }
   });
   return groups;
 }
-function createCitationSpan(label, displayValue, ids) {
-  const span = document.createElement("span");
-  span.className = "refmanager-citation";
-  span.contentEditable = "false";
-  span.textContent = `[${displayValue}]`;
-  span.dataset.refmanager = JSON.stringify({ label, ids, displayValue });
-  return span;
+
+function createCitationLink(displayValue, replacement) {
+  const sup = document.createElement("sup");
+  const anchor = document.createElement("a");
+  const urls = replacement.urls || [];
+  sup.className = "refmanager-citation";
+  sup.contentEditable = "true";
+  sup.dataset.refmanager = JSON.stringify({ displayValue, urls, ids: replacement.ids || [], label: replacement.label });
+  anchor.textContent = `[${displayValue}]`;
+  anchor.href = urls[0] || "#";
+  anchor.title = replacement.title || urls.join("\n");
+  anchor.target = "_blank";
+  anchor.rel = "noopener noreferrer";
+  sup.appendChild(anchor);
+  return sup;
 }
-function replacePatternInText(node, pattern, parser, replacements, label) {
+
+function replacePatternInText(node, replacements) {
   const original = node.nodeValue;
-  if (!original || !pattern.test(original)) { pattern.lastIndex = 0; return 0; }
-  pattern.lastIndex = 0;
+  if (!original || !TOKEN_PATTERN.test(original)) { TOKEN_PATTERN.lastIndex = 0; return 0; }
+  TOKEN_PATTERN.lastIndex = 0;
   const fragment = document.createDocumentFragment();
   let last = 0; let count = 0; let match;
-  while ((match = pattern.exec(original)) !== null) {
+  while ((match = TOKEN_PATTERN.exec(original)) !== null) {
     fragment.appendChild(document.createTextNode(original.slice(last, match.index)));
-    const parsedIds = parser(match[1]);
-    const replacement = replacements.get(`${label}|${parsedIds.map(normalizeToken).join(";")}`);
-    fragment.appendChild(replacement ? createCitationSpan(label, replacement.display, parsedIds) : document.createTextNode(match[0]));
-    if (replacement) count += 1;
+    const parsed = parseAllowedTokenGroup(match[0]);
+    const replacement = parsed ? replacements.get(`${parsed.label}|${parsed.ids.map(normalizeToken).join(";")}`) : null;
+    fragment.appendChild(replacement?.display ? createCitationLink(replacement.display, { ...replacement, ...parsed }) : document.createTextNode(match[0]));
+    if (replacement?.display) count += 1;
     last = match.index + match[0].length;
   }
   fragment.appendChild(document.createTextNode(original.slice(last)));
   node.parentNode?.replaceChild(fragment, node);
   return count;
 }
+
 function processEditableRoots(replacements) {
   let replaced = 0;
   getEditorRoots().forEach((root) => {
@@ -71,34 +109,10 @@ function processEditableRoots(replacements) {
     const nodes = []; let current;
     while ((current = walker.nextNode())) nodes.push(current);
     nodes.forEach((node) => {
-      replaced += replacePatternInText(node, DOI_GROUP_PATTERN, parseDoiGroup, replacements, "DOI");
-      replaced += replacePatternInText(node, PMID_GROUP_PATTERN, parsePmidGroup, replacements, "PMID");
+      replaced += replacePatternInText(node, replacements);
     });
   });
   return replaced;
-}
-
-function formatCitationField(indices) {
-  const sorted = [...new Set(indices)].sort((a, b) => a - b);
-  if (!sorted.length) return "";
-  if (sorted.length > 3) return `${sorted[0]}-${sorted[sorted.length - 1]}`;
-  return sorted.join(",");
-}
-function refreshCitationSpanOrder() {
-  const refOrder = new Map(); let nextIndex = 1;
-  getEditorRoots().flatMap((root) => [...root.querySelectorAll('.refmanager-citation')]).forEach((span) => {
-    let payload = {};
-    try { payload = JSON.parse(span.dataset.refmanager || "{}"); } catch (_err) {}
-    const label = payload.label || "DOI";
-    const ids = (payload.ids || []).map((id) => normalizeToken(label === "PMID" ? String(id).replace(/^PMID:/i, "") : id));
-    const displayValue = formatCitationField(ids.map((id) => {
-      const key = `${label}|${id}`;
-      if (!refOrder.has(key)) refOrder.set(key, nextIndex++);
-      return refOrder.get(key);
-    }));
-    span.textContent = `[${displayValue}]`;
-    span.dataset.refmanager = JSON.stringify({ ...payload, ids, displayValue });
-  });
 }
 
 function convertDocTokensWithAutoLookup(sendResponse) {
@@ -106,16 +120,20 @@ function convertDocTokensWithAutoLookup(sendResponse) {
     chrome.runtime.sendMessage({ type: "ingestTokensAndBuildCitations", groups: collectTokenGroups(), ...getDocContext() }, (response) => {
       if (chrome.runtime.lastError) return sendResponse({ ok: false, error: chrome.runtime.lastError.message });
       if (!response?.ok) return sendResponse({ ok: false, error: response?.error || "Failed to ingest tokens." });
-      const replacements = new Map((response.replacements || []).map((r) => [r.key, { display: r.display }]));
+      const replacements = new Map((response.replacements || []).map((r) => [r.key, { display: r.display, urls: r.urls || [], title: r.title || "" }]));
       const replacedCount = processEditableRoots(replacements);
-      refreshCitationSpanOrder();
-      const tokenReplacements = (response.replacements || []).filter((r) => r.rawToken).map((r) => ({ rawToken: r.rawToken, display: r.display }));
-      chrome.runtime.sendMessage({ type: "applyDocCitationsAndReferences", docId: response?.docKey || getDocContext().docId, tokenReplacements }, () => {});
-      if (!replacedCount && !response?.foundGroups) {
-        const fallbackHint = response?.fallbackError ? ` Fallback details: ${response.fallbackError}` : "";
-        return sendResponse({ ok: false, error: `No DOI/PMID token groups were found to replace. Found groups: ${(collectTokenGroups() || []).length}.${fallbackHint}` });
-      }
-      sendResponse({ ok: true, imported: response.imported, failed: response.failed, replacedCount });
+      const tokenReplacements = (response.replacements || [])
+        .filter((r) => r.rawToken && r.display)
+        .map((r) => ({ rawToken: r.rawToken, display: r.display, urls: r.urls || [], title: r.title || "" }));
+      chrome.runtime.sendMessage({ type: "applyDocCitationsAndReferences", docId: response?.docKey || getDocContext().docId, tokenReplacements }, (applyResponse) => {
+        if (chrome.runtime.lastError) return sendResponse({ ok: false, error: chrome.runtime.lastError.message });
+        if (!applyResponse?.ok) return sendResponse({ ok: false, error: applyResponse?.error || "Failed to update Google Doc." });
+        if (!replacedCount && !response?.foundGroups) {
+          const fallbackHint = response?.fallbackError ? ` Fallback details: ${response.fallbackError}` : "";
+          return sendResponse({ ok: false, error: `No valid DOI/PMID token groups were found to replace. Found groups: ${(collectTokenGroups() || []).length}.${fallbackHint}` });
+        }
+        sendResponse({ ok: true, imported: response.imported, failed: response.failed, replacedCount: tokenReplacements.length || replacedCount, styledCount: applyResponse.styledCount || 0 });
+      });
     });
   } catch (error) { sendResponse({ ok: false, error: error.message || "Token conversion failed." }); }
 }

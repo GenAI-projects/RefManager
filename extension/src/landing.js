@@ -68,6 +68,7 @@ document.getElementById('check').addEventListener('click', () => {
       `Can write test file: ${res.writeCheck ? 'Yes' : 'No'}`,
       `Can edit test file: ${res.editCheck ? 'Yes' : 'No'}`,
       `Can delete test file: ${res.deleteCheck ? 'Yes' : 'No'}`,
+      `Library file: ${res.libraryFile || 'refmanager-library.json'}`,
       `Drive checks completed at: ${new Date().toISOString()}`
     ]);
   });
