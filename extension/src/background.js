@@ -1,6 +1,9 @@
 const DOI_PATTERN = /^10\.\d{4,9}\/\S+$/i;
 const PMID_PATTERN = /^\d{1,10}$/;
 const DOI_URL_PREFIX_PATTERN = /^https?:\/\/(?:dx\.)?doi\.org\//i;
+const DRIVE_LIBRARY_FILENAME = "refmanager-library.json";
+const LEGACY_SHARED_LIBRARY_FILENAME = "refmanager-shared-library.json";
+const REFERENCES_MARKER = "References (RefManager)";
 
 const REQUIRED_SCOPES = [
   "https://www.googleapis.com/auth/drive.appdata",
@@ -22,19 +25,101 @@ async function tokenHasRequiredScopes(token) {
   }
 }
 
-async function getLibrary() {
-  const { library = [], citationStyle = "apa", librariesByDoc = {}, activeDocKey = null } = await chrome.storage.local.get(["library", "citationStyle", "librariesByDoc", "activeDocKey"]);
-  return { library, citationStyle, librariesByDoc, activeDocKey };
+function createEmptyLibraryState() {
+  return { library: [], citationStyle: "apa", librariesByDoc: {}, activeDocKey: null, updatedAt: new Date().toISOString() };
 }
 
-async function saveLibrary(library) {
-  await chrome.storage.local.set({ library });
+async function getCachedLibraryState() {
+  const { library = [], citationStyle = "apa", librariesByDoc = {}, activeDocKey = null, driveLibraryCache = null } = await chrome.storage.local.get(["library", "citationStyle", "librariesByDoc", "activeDocKey", "driveLibraryCache"]);
+  if (driveLibraryCache) return normalizeLibraryState(driveLibraryCache);
+  return normalizeLibraryState({ library, citationStyle, librariesByDoc, activeDocKey });
 }
 
-async function saveLibraryForDoc(docKey, docName, library, librariesByDoc) {
-  const updated = { ...(librariesByDoc || {}) };
-  updated[docKey] = { docName, library, updatedAt: new Date().toISOString() };
-  await chrome.storage.local.set({ library, librariesByDoc: updated, activeDocKey: docKey });
+function normalizeLibraryState(payload = {}) {
+  return {
+    ...createEmptyLibraryState(),
+    ...payload,
+    library: Array.isArray(payload.library) ? payload.library : [],
+    citationStyle: payload.citationStyle || "apa",
+    librariesByDoc: payload.librariesByDoc && typeof payload.librariesByDoc === "object" ? payload.librariesByDoc : {},
+    activeDocKey: payload.activeDocKey || null,
+    updatedAt: payload.updatedAt || new Date().toISOString()
+  };
+}
+
+async function cacheLibraryState(state) {
+  const normalized = normalizeLibraryState(state);
+  await chrome.storage.local.set({
+    driveLibraryCache: normalized,
+    library: normalized.library,
+    citationStyle: normalized.citationStyle,
+    librariesByDoc: normalized.librariesByDoc,
+    activeDocKey: normalized.activeDocKey
+  });
+  return normalized;
+}
+
+async function findDriveAppDataFile(token, name) {
+  const escapedName = String(name).replace(/'/g, "\\'");
+  const query = `name='${escapedName}' and trashed=false and 'appDataFolder' in parents`;
+  const list = await googleApi(`/drive/v3/files?q=${encodeURIComponent(query)}&spaces=appDataFolder&fields=files(id,name,modifiedTime)`, token);
+  return list?.files?.[0] || null;
+}
+
+async function uploadDriveJson(token, fileId, payload) {
+  const response = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(fileId)}?uploadType=media`, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  if (!response.ok) {
+    let details = "";
+    try {
+      const err = await response.json();
+      details = err?.error?.message ? ` - ${err.error.message}` : "";
+    } catch (_error) {}
+    throw new Error(`Google API PATCH /upload/drive/v3/files/${fileId} failed: ${response.status}${details}`);
+  }
+  return response.status === 204 ? {} : response.json().catch(() => ({}));
+}
+
+async function readDriveLibraryState(token) {
+  const file = await findDriveAppDataFile(token, DRIVE_LIBRARY_FILENAME);
+  if (!file) return null;
+  const payload = await googleApi(`/drive/v3/files/${encodeURIComponent(file.id)}?alt=media`, token);
+  return normalizeLibraryState(payload);
+}
+
+async function writeDriveLibraryState(token, state) {
+  const normalized = normalizeLibraryState({ ...state, updatedAt: new Date().toISOString() });
+  let file = await findDriveAppDataFile(token, DRIVE_LIBRARY_FILENAME);
+  if (!file) {
+    file = await googleApi("/drive/v3/files", token, "POST", { name: DRIVE_LIBRARY_FILENAME, parents: ["appDataFolder"], mimeType: "application/json" });
+  }
+  await uploadDriveJson(token, file.id, normalized);
+  await cacheLibraryState(normalized);
+  return normalized;
+}
+
+async function loadLibraryState({ interactive = false } = {}) {
+  try {
+    const token = await getAuthToken(interactive);
+    const driveState = await readDriveLibraryState(token);
+    if (driveState) return cacheLibraryState(driveState);
+
+    const cached = await getCachedLibraryState();
+    const hasLegacyData = cached.library.length || Object.keys(cached.librariesByDoc || {}).length;
+    const initialized = hasLegacyData ? cached : createEmptyLibraryState();
+    return writeDriveLibraryState(token, initialized);
+  } catch (error) {
+    if (interactive) throw error;
+    return getCachedLibraryState();
+  }
+}
+
+async function saveLibraryState(state) {
+  const token = await getAuthToken(true);
+  return writeDriveLibraryState(token, state);
 }
 
 function normalizeIdentifier(value) {
@@ -47,11 +132,26 @@ function normalizeDoiCandidate(value) {
   return raw.replace(DOI_URL_PREFIX_PATTERN, "");
 }
 
+function normalizeTokenValue(label, value) {
+  return label === "PMID" ? normalizeIdentifier(String(value).replace(/^PMID:\s*/i, "")) : normalizeDoiCandidate(value);
+}
+
 function formatCitationField(indices) {
   if (!indices.length) return "";
   const sorted = [...new Set(indices)].sort((a, b) => a - b);
   if (sorted.length > 3) return `${sorted[0]}-${sorted[sorted.length - 1]}`;
   return sorted.join(",");
+}
+
+function paperUrl(record, fallbackId = "") {
+  if (record?.url) return record.url;
+  if (record?.doi) return `https://doi.org/${record.doi}`;
+  if (record?.pmid) return `https://pubmed.ncbi.nlm.nih.gov/${record.pmid}/`;
+  return fallbackId && DOI_PATTERN.test(fallbackId) ? `https://doi.org/${fallbackId}` : "";
+}
+
+function createCitationTooltip(records) {
+  return records.map((record, idx) => `${idx + 1}. ${record.title || record.doi || record.pmid || "Reference"} ${paperUrl(record)}`).join("\n");
 }
 
 async function upsertIdentifier(mode, rawValue, currentLibrary) {
@@ -115,8 +215,6 @@ async function fetchReferenceByPmid(pmid) {
   };
 }
 
-
-
 function mergeLibraries(localLibrary, sharedLibrary) {
   const map = new Map();
   for (const item of [...sharedLibrary, ...localLibrary]) {
@@ -140,36 +238,40 @@ function formatCitation(record, style) {
   return `${authors} (${record.year}). ${record.title}. ${record.journal}.`;
 }
 
+function parseAllowedTokenGroup(rawToken) {
+  const token = String(rawToken || "").trim();
+  const inner = token.match(/^\{\s*([^{}]+?)\s*\}$/)?.[1];
+  if (!inner) return null;
+  const parts = inner.split(";").map((x) => x.trim()).filter(Boolean);
+  if (!parts.length) return null;
+
+  const parsed = parts.map((part) => {
+    const doiMatch = part.match(/^DOI\s*:\s*(10\.\d{4,9}\/\S+)$/i);
+    if (doiMatch) return { style: "DOI", id: normalizeDoiCandidate(doiMatch[1]) };
+    const doiUrlMatch = part.match(/^(https?:\/\/(?:dx\.)?doi\.org\/10\.\d{4,9}\/\S+)$/i);
+    if (doiUrlMatch) return { style: "DOI_URL", id: normalizeDoiCandidate(doiUrlMatch[1]) };
+    const pmidMatch = part.match(/^PMID\s*:\s*(\d{1,10})$/i);
+    if (pmidMatch) return { style: "PMID", id: normalizeIdentifier(pmidMatch[1]) };
+    return null;
+  });
+
+  if (parsed.some((x) => !x)) return null;
+  const styles = new Set(parsed.map((x) => x.style));
+  if (styles.size !== 1) return null;
+  const style = parsed[0].style;
+  const label = style === "PMID" ? "PMID" : "DOI";
+  const ids = parsed.map((x) => x.id).filter((id) => label === "PMID" ? PMID_PATTERN.test(id) : DOI_PATTERN.test(id));
+  if (ids.length !== parsed.length) return null;
+  return { label, tokenStyle: style, ids, rawToken: token };
+}
+
 function extractTokenGroupsFromText(text = "") {
   const groups = [];
-  const doiPattern = /\{([^{}]*(?:10\.\d{4,9}\/\S+|https?:\/\/(?:dx\.)?doi\.org\/\S+)[^{}]*)\}/gi;
-  const pmidPattern = /\{([^{}]*PMID:\s*\d+[^{}]*)\}/gi;
-  const doiUrlPattern = /\{([^{}]*DOI_URL[^{}]*)\}/gi;
-  const pmidUrlPattern = /\{([^{}]*PMID_URL[^{}]*)\}/gi;
+  const tokenPattern = /\{[^{}]+\}/g;
   let match;
-  while ((match = doiPattern.exec(text)) !== null) {
-    const ids = match[1].split(/[;:]/).map((x) => normalizeDoiCandidate(x)).filter((x) => DOI_PATTERN.test(x));
-    if (ids.length) groups.push({ label: "DOI", ids, rawToken: match[0] });
-  }
-  while ((match = pmidPattern.exec(text)) !== null) {
-    groups.push({ label: "PMID", ids: match[1].split(";").map((x) => x.replace(/PMID:\s*/gi, "").trim()).filter(Boolean), rawToken: match[0] });
-  }
-  while ((match = doiUrlPattern.exec(text)) !== null) {
-    const ids = match[1]
-      .split(":")
-      .map((x) => x.replace(/DOI_URL\s*\d*\s*/gi, "").trim())
-      .map((x) => normalizeDoiCandidate(x))
-      .filter((x) => DOI_PATTERN.test(x));
-    if (ids.length) groups.push({ label: "DOI", ids, rawToken: match[0] });
-  }
-  while ((match = pmidUrlPattern.exec(text)) !== null) {
-    const ids = match[1]
-      .split(":")
-      .map((x) => x.replace(/PMID_URL\s*\d*\s*/gi, "").trim())
-      .map((x) => x.replace(/^https?:\/\/pubmed\.ncbi\.nlm\.nih\.gov\//i, ""))
-      .map((x) => x.replace(/\/$/, ""))
-      .filter((x) => PMID_PATTERN.test(x));
-    if (ids.length) groups.push({ label: "PMID", ids, rawToken: match[0] });
+  while ((match = tokenPattern.exec(text)) !== null) {
+    const parsed = parseAllowedTokenGroup(match[0]);
+    if (parsed) groups.push(parsed);
   }
   return groups;
 }
@@ -191,9 +293,9 @@ function parseDocIdFromUrl(url = "") {
   return match?.[1] || "";
 }
 
-async function ingestAndBuildForDoc({ docId, docName, library, librariesByDoc }) {
+async function ingestAndBuildForDoc({ docId, docName, libraryState }) {
   const docKey = docId || "default-doc";
-  const scopedLibrary = librariesByDoc?.[docKey]?.library || library;
+  const scopedLibrary = libraryState.librariesByDoc?.[docKey]?.library || libraryState.library;
   let workingLibrary = [...scopedLibrary];
   let imported = 0;
   const failed = [];
@@ -204,25 +306,63 @@ async function ingestAndBuildForDoc({ docId, docName, library, librariesByDoc })
   const incomingGroups = extractTokenGroupsFromText(docText);
 
   for (const group of incomingGroups) {
-    const mode = (group.label || "").toLowerCase() === "pmid" ? "pmid" : "doi";
-    const ids = (group.ids || []).map((x) => normalizeIdentifier(mode === "pmid" ? String(x).replace(/^PMID:/i, "") : x)).filter(Boolean);
-    const citationIndexes = [];
-    for (const id of ids) {
-      try {
-        const result = await upsertIdentifier(mode, id, workingLibrary);
-        workingLibrary = result.library;
-        if (result.imported) imported += 1;
-        if (result.record) citationIndexes.push(workingLibrary.indexOf(result.record) + 1);
-      } catch (error) {
-        failed.push({ id, error: error.message });
-      }
-    }
-    const key = `${mode === "pmid" ? "PMID" : "DOI"}|${ids.join(";")}`;
-    replacements.push({ key, display: formatCitationField(citationIndexes), rawToken: group.rawToken || "" });
+    const processed = await buildReplacementForGroup(group, workingLibrary);
+    workingLibrary = processed.library;
+    imported += processed.imported;
+    failed.push(...processed.failed);
+    replacements.push(processed.replacement);
   }
 
-  await saveLibraryForDoc(docKey, docName || "Google Doc", workingLibrary, librariesByDoc);
-  return { replacements, imported, failed, foundGroups: incomingGroups.length, docKey, workingLibrary };
+  const updatedState = saveLibraryForDocState(libraryState, docKey, docName || "Google Doc", workingLibrary);
+  await saveLibraryState(updatedState);
+  return { replacements, imported, failed, foundGroups: incomingGroups.length, docKey, workingLibrary, libraryState: updatedState };
+}
+
+function saveLibraryForDocState(libraryState, docKey, docName, library) {
+  const updated = { ...(libraryState.librariesByDoc || {}) };
+  updated[docKey] = { ...(updated[docKey] || {}), docName, library, updatedAt: new Date().toISOString() };
+  return normalizeLibraryState({ ...libraryState, library, librariesByDoc: updated, activeDocKey: docKey });
+}
+
+async function buildReplacementForGroup(group, startingLibrary) {
+  const mode = (group.label || "").toLowerCase() === "pmid" ? "pmid" : "doi";
+  const ids = (group.ids || []).map((x) => normalizeTokenValue(mode === "pmid" ? "PMID" : "DOI", x)).filter(Boolean);
+  let workingLibrary = [...startingLibrary];
+  let imported = 0;
+  const failed = [];
+  const citationIndexes = [];
+  const records = [];
+
+  for (const id of ids) {
+    try {
+      const result = await upsertIdentifier(mode, id, workingLibrary);
+      workingLibrary = result.library;
+      if (result.imported) imported += 1;
+      if (result.record) {
+        citationIndexes.push(workingLibrary.indexOf(result.record) + 1);
+        records.push(result.record);
+      }
+    } catch (error) {
+      failed.push({ id, error: error.message });
+    }
+  }
+
+  const key = `${mode === "pmid" ? "PMID" : "DOI"}|${ids.join(";")}`;
+  const display = formatCitationField(citationIndexes);
+  return {
+    library: workingLibrary,
+    imported,
+    failed,
+    replacement: {
+      key,
+      display,
+      rawToken: group.rawToken || "",
+      ids,
+      label: mode === "pmid" ? "PMID" : "DOI",
+      urls: records.map((record, idx) => paperUrl(record, ids[idx])).filter(Boolean),
+      title: createCitationTooltip(records)
+    }
+  };
 }
 
 async function getAuthenticatedProfileEmail() {
@@ -257,37 +397,110 @@ async function diagnoseDocAccess(docId) {
   }
 }
 
+function docsTextStyleForCitation(urls) {
+  const firstUrl = urls?.[0] || "";
+  return {
+    baselineOffset: "SUPERSCRIPT",
+    ...(firstUrl ? { link: { url: firstUrl } } : {}),
+    fontSize: { magnitude: 9, unit: "PT" },
+    foregroundColor: { color: { rgbColor: { blue: 0.8, red: 0.06, green: 0.33 } } }
+  };
+}
+
+function docsTextStyleFieldsForCitation(urls) {
+  return urls?.[0] ? "baselineOffset,link,fontSize,foregroundColor" : "baselineOffset,fontSize,foregroundColor";
+}
+
+function extractReferenceMarkerRange(doc) {
+  let cursor = 1;
+  for (const block of (doc?.body?.content || [])) {
+    const elements = block?.paragraph?.elements || [];
+    for (const el of elements) {
+      const content = el?.textRun?.content || "";
+      const markerIndex = content.indexOf(REFERENCES_MARKER);
+      if (markerIndex >= 0) {
+        const startIndex = (el.startIndex || cursor) + markerIndex;
+        const endIndex = doc?.body?.content?.[doc.body.content.length - 1]?.endIndex || startIndex + REFERENCES_MARKER.length;
+        return { startIndex, endIndex: Math.max(startIndex + REFERENCES_MARKER.length, endIndex - 1) };
+      }
+      cursor = el.endIndex || cursor + content.length;
+    }
+  }
+  return null;
+}
+
 async function applyDocCitationsAndReferencesForLibrary({ docId, tokenReplacements, citationStyle, scopedLibrary }) {
   const token = await getAuthToken(true);
-  const replaceRequests = tokenReplacements.map((r) => ({
-    replaceAllText: {
-      containsText: { text: r.rawToken, matchCase: true },
-      replaceText: `[${r.display}]`
-    }
-  }));
-  const citedDisplays = new Set(tokenReplacements.map((r) => String(r.display || "")).filter(Boolean));
-  const citedIndices = [...citedDisplays]
-    .flatMap((d) => d.split(/[,-]/).map((n) => Number(n.trim())).filter((n) => Number.isInteger(n) && n > 0));
-  const uniqueIndices = [...new Set(citedIndices)].sort((a, b) => a - b);
-  const references = uniqueIndices.map((idx) => {
-    const rec = scopedLibrary[idx - 1];
-    return rec ? `${idx}. ${formatCitation(rec, citationStyle)}` : "";
-  }).filter(Boolean).join("\n");
-  if (!replaceRequests.length && !references) return { ok: true, skipped: true };
-  const marker = "References (RefManager)";
   const docMeta = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
   const endIndex = docMeta?.body?.content?.[docMeta.body.content.length - 1]?.endIndex || 1;
-  const requests = [...replaceRequests];
-  if (references) {
+  const requests = [];
+  const existingReferenceRange = extractReferenceMarkerRange(docMeta);
+  if (existingReferenceRange) {
+    requests.push({ deleteContentRange: { range: existingReferenceRange } });
+  }
+
+  for (const r of tokenReplacements) {
+    if (!r.rawToken || !r.display) continue;
     requests.push({
-      insertText: {
-        location: { index: Math.max(1, endIndex - 1) },
-        text: `\n\n${marker}\n${references}\n`
+      replaceAllText: {
+        containsText: { text: r.rawToken, matchCase: true },
+        replaceText: `[${r.display}]`
       }
     });
   }
+
+  const citedDisplays = new Set(tokenReplacements.map((r) => String(r.display || "")).filter(Boolean));
+  const citedIndices = [...citedDisplays].flatMap((d) => {
+    if (d.includes("-")) {
+      const [start, end] = d.split("-").map((n) => Number(n.trim()));
+      if (Number.isInteger(start) && Number.isInteger(end) && end >= start) return Array.from({ length: end - start + 1 }, (_x, i) => start + i);
+    }
+    return d.split(",").map((n) => Number(n.trim())).filter((n) => Number.isInteger(n) && n > 0);
+  });
+  const uniqueIndices = [...new Set(citedIndices)].sort((a, b) => a - b);
+  const references = uniqueIndices.map((idx) => {
+    const rec = scopedLibrary[idx - 1];
+    return rec ? `${idx}. ${formatCitation(rec, citationStyle)} ${paperUrl(rec)}` : "";
+  }).filter(Boolean).join("\n");
+
+  if (references) {
+    requests.push({
+      insertText: {
+        location: { index: Math.max(1, existingReferenceRange ? existingReferenceRange.startIndex : endIndex - 1) },
+        text: `\n\n${REFERENCES_MARKER}\n${references}\n`
+      }
+    });
+  }
+
+  if (!requests.length) return { ok: true, skipped: true };
   await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}:batchUpdate`, token, "POST", { requests });
-  return { ok: true };
+
+  const updatedDoc = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
+  const styleRequests = [];
+  for (const r of tokenReplacements) {
+    if (!r.display) continue;
+    const citationText = `[${r.display}]`;
+    for (const block of (updatedDoc?.body?.content || [])) {
+      for (const el of (block?.paragraph?.elements || [])) {
+        const content = el?.textRun?.content || "";
+        let idx = content.indexOf(citationText);
+        while (idx >= 0) {
+          const startIndex = (el.startIndex || 1) + idx;
+          const end = startIndex + citationText.length;
+          styleRequests.push({
+            updateTextStyle: {
+              range: { startIndex, endIndex: end },
+              textStyle: docsTextStyleForCitation(r.urls || []),
+              fields: docsTextStyleFieldsForCitation(r.urls || [])
+            }
+          });
+          idx = content.indexOf(citationText, idx + citationText.length);
+        }
+      }
+    }
+  }
+  if (styleRequests.length) await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}:batchUpdate`, token, "POST", { requests: styleRequests });
+  return { ok: true, styledCount: styleRequests.length };
 }
 
 async function getAuthToken(interactive = false) {
@@ -319,8 +532,16 @@ async function getAuthToken(interactive = false) {
   return token;
 }
 
+function googleApiUrl(path) {
+  const normalizedPath = String(path);
+  if (normalizedPath.startsWith("/docs/v1/")) {
+    return `https://docs.googleapis.com${normalizedPath.replace(/^\/docs/, "")}`;
+  }
+  return `https://www.googleapis.com${normalizedPath}`;
+}
+
 async function googleApi(path, token, method = "GET", body, headers = {}) {
-  const response = await fetch(`https://www.googleapis.com${path}`, {
+  const response = await fetch(googleApiUrl(path), {
     method,
     headers: {
       Authorization: `Bearer ${token}`,
@@ -349,24 +570,15 @@ async function googleApi(path, token, method = "GET", body, headers = {}) {
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   (async () => {
-    const { library, citationStyle, librariesByDoc } = await getLibrary();
-
     if (message?.type === "addIdentifier") {
+      const libraryState = await loadLibraryState({ interactive: true });
       const raw = (message.value ?? "").trim();
       const mode = (message.mode ?? "doi").toLowerCase();
       try {
-        let record;
-        if (mode === "doi") {
-          if (!DOI_PATTERN.test(raw)) throw new Error("Invalid DOI format.");
-          if (library.some((x) => x.doi?.toLowerCase() === raw.toLowerCase())) throw new Error("DOI already exists.");
-          record = await fetchReferenceByDoi(raw);
-        } else {
-          if (!PMID_PATTERN.test(raw)) throw new Error("Invalid PMID format.");
-          if (library.some((x) => x.pmid === raw)) throw new Error("PMID already exists.");
-          record = await fetchReferenceByPmid(raw);
-        }
-        await saveLibrary([...library, record]);
-        sendResponse({ ok: true, record });
+        const result = await upsertIdentifier(mode, raw, libraryState.library);
+        const updatedState = normalizeLibraryState({ ...libraryState, library: result.library });
+        await saveLibraryState(updatedState);
+        sendResponse({ ok: true, record: result.record });
       } catch (error) {
         sendResponse({ ok: false, error: `${error.message}. If this is 403, re-login with consent and ensure Drive API is enabled for this OAuth project.` });
       }
@@ -374,42 +586,34 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
 
     if (message?.type === "listLibrary") {
-      sendResponse({ ok: true, library, citationStyle });
+      try {
+        const libraryState = await loadLibraryState({ interactive: false });
+        sendResponse({ ok: true, library: libraryState.library, citationStyle: libraryState.citationStyle, driveBacked: true });
+      } catch (error) {
+        sendResponse({ ok: false, error: error.message, library: [], citationStyle: "apa" });
+      }
       return;
     }
 
     if (message?.type === "setCitationStyle") {
-      await chrome.storage.local.set({ citationStyle: message.style || "apa" });
+      const libraryState = await loadLibraryState({ interactive: true });
+      const updatedState = normalizeLibraryState({ ...libraryState, citationStyle: message.style || "apa" });
+      await saveLibraryState(updatedState);
       sendResponse({ ok: true });
       return;
     }
 
     if (message?.type === "citationPreview") {
-      sendResponse({ ok: true, citations: library.map((r) => formatCitation(r, citationStyle)) });
+      const libraryState = await loadLibraryState({ interactive: false });
+      sendResponse({ ok: true, citations: libraryState.library.map((r) => formatCitation(r, libraryState.citationStyle)) });
       return;
     }
 
-
     if (message?.type === "syncLibraryPush") {
       try {
-        const token = await getAuthToken(true);
-        const payload = {
-          updatedAt: new Date().toISOString(),
-          library,
-          csl: JSON.stringify(library),
-          bib: library.map((r, i) => `@article{ref${i + 1}, title={${r.title || ""}}, author={${r.authors || ""}}, year={${r.year || ""}}, doi={${r.doi || ""}}}`).join("\n\n"),
-          ris: library.map((r) => `TY  - JOUR\nTI  - ${r.title || ""}\nAU  - ${r.authors || ""}\nPY  - ${r.year || ""}\nDO  - ${r.doi || ""}\nER  -`).join("\n\n")
-        };
-        await chrome.storage.sync.set({ sharedLibraryPayload: payload });
-        const list = await googleApi("/drive/v3/files?q=name='refmanager-shared-library.json' and trashed=false and 'appDataFolder' in parents&spaces=appDataFolder&fields=files(id,name)", token);
-        const existingId = list?.files?.[0]?.id;
-        if (existingId) {
-          await googleApi(`/upload/drive/v3/files/${existingId}?uploadType=media`, token, "PATCH", payload);
-        } else {
-          const created = await googleApi("/drive/v3/files", token, "POST", { name: "refmanager-shared-library.json", parents: ["appDataFolder"] });
-          await googleApi(`/upload/drive/v3/files/${created.id}?uploadType=media`, token, "PATCH", payload);
-        }
-        sendResponse({ ok: true, count: library.length });
+        const cached = await getCachedLibraryState();
+        const saved = await saveLibraryState(cached);
+        sendResponse({ ok: true, count: saved.library.length, file: DRIVE_LIBRARY_FILENAME });
       } catch (error) {
         sendResponse({ ok: false, error: error.message });
       }
@@ -419,16 +623,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === "syncLibraryPull") {
       try {
         const token = await getAuthToken(true);
-        const list = await googleApi("/drive/v3/files?q=name='refmanager-shared-library.json' and trashed=false and 'appDataFolder' in parents&spaces=appDataFolder&fields=files(id,name)", token);
-        if (list?.files?.[0]?.id) {
-          const json = await googleApi(`/drive/v3/files/${list.files[0].id}?alt=media`, token);
-          if (json && Object.keys(json).length) await chrome.storage.sync.set({ sharedLibraryPayload: json });
+        const driveState = await readDriveLibraryState(token);
+        const legacyFile = await findDriveAppDataFile(token, LEGACY_SHARED_LIBRARY_FILENAME);
+        let importedLegacy = 0;
+        let finalState = driveState || createEmptyLibraryState();
+        if (legacyFile) {
+          const legacyJson = await googleApi(`/drive/v3/files/${legacyFile.id}?alt=media`, token);
+          const shared = legacyJson?.library || [];
+          if (shared.length) {
+            finalState = normalizeLibraryState({ ...finalState, library: mergeLibraries(finalState.library, shared) });
+            importedLegacy = shared.length;
+          }
         }
-        const { sharedLibraryPayload } = await chrome.storage.sync.get(["sharedLibraryPayload"]);
-        const shared = sharedLibraryPayload?.library || [];
-        const merged = mergeLibraries(library, shared);
-        await saveLibrary(merged);
-        sendResponse({ ok: true, count: merged.length, resolved: library.length + shared.length - merged.length });
+        finalState = await writeDriveLibraryState(token, finalState);
+        sendResponse({ ok: true, count: finalState.library.length, resolved: importedLegacy, file: DRIVE_LIBRARY_FILENAME });
       } catch (error) {
         sendResponse({ ok: false, error: error.message });
       }
@@ -439,7 +647,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       try {
         const token = await getAuthToken(true);
         const profile = await googleApi("/oauth2/v2/userinfo", token);
-        sendResponse({ ok: true, email: profile?.email, scopes: ["drive.appdata", "drive.file", "drive.metadata.readonly", "userinfo.email"] });
+        await loadLibraryState({ interactive: true });
+        sendResponse({ ok: true, email: profile?.email, scopes: REQUIRED_SCOPES });
       } catch (error) {
         sendResponse({ ok: false, error: error.message });
       }
@@ -450,11 +659,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       try {
         const token = await getAuthToken(true);
         const profile = await googleApi("/oauth2/v2/userinfo", token);
-        const created = await googleApi("/drive/v3/files", token, "POST", { name: `refmanager-permission-check-${Date.now()}.json`, parents: ["appDataFolder"] });
-        await fetch(`https://www.googleapis.com/upload/drive/v3/files/${created.id}?uploadType=media`, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ ping: "ok" }) });
-        await fetch(`https://www.googleapis.com/upload/drive/v3/files/${created.id}?uploadType=media`, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ ping: "edited" }) });
-        await fetch(`https://www.googleapis.com/drive/v3/files/${created.id}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } });
-        sendResponse({ ok: true, email: profile?.email, profileRead: true, writeCheck: true, editCheck: true, deleteCheck: true });
+        const created = await googleApi("/drive/v3/files", token, "POST", { name: `refmanager-permission-check-${Date.now()}.json`, parents: ["appDataFolder"], mimeType: "application/json" });
+        await uploadDriveJson(token, created.id, { ping: "ok" });
+        await uploadDriveJson(token, created.id, { ping: "edited" });
+        await googleApi(`/drive/v3/files/${created.id}`, token, "DELETE");
+        await loadLibraryState({ interactive: true });
+        sendResponse({ ok: true, email: profile?.email, profileRead: true, writeCheck: true, editCheck: true, deleteCheck: true, libraryFile: DRIVE_LIBRARY_FILENAME });
       } catch (error) {
         sendResponse({ ok: false, error: error.message });
       }
@@ -462,12 +672,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
 
     if (message?.type === "linkCurrentDoc") {
-      const docId = (message.docId || '').trim();
+      const libraryState = await loadLibraryState({ interactive: false });
+      const docId = (message.docId || "").trim();
       if (!docId) {
-        sendResponse({ ok: false, error: 'Missing Google Doc ID.' });
+        sendResponse({ ok: false, error: "Missing Google Doc ID." });
         return;
       }
-      let docName = (message.docName || 'Google Doc').replace(/\s+-\s+Google Docs\s*$/i, '').trim();
+      let docName = (message.docName || "Google Doc").replace(/\s+-\s+Google Docs\s*$/i, "").trim();
       if (!docName || /^Manual Doc\b/i.test(docName)) {
         try {
           const token = await getAuthToken(false);
@@ -477,20 +688,21 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           // best effort; keep provided name when metadata lookup is unavailable
         }
       }
-      const updated = { ...(librariesByDoc || {}) };
-      updated[docId] = { docName, library: updated[docId]?.library || library, updatedAt: new Date().toISOString(), url: message.url || '' };
-      await chrome.storage.local.set({ librariesByDoc: updated, activeDocKey: docId });
-      sendResponse({ ok: true, docId, docName });
+      const updated = { ...(libraryState.librariesByDoc || {}) };
+      updated[docId] = { ...(updated[docId] || {}), docName, library: updated[docId]?.library || libraryState.library, updatedAt: new Date().toISOString(), url: message.url || "" };
+      const saved = await saveLibraryState(normalizeLibraryState({ ...libraryState, librariesByDoc: updated, activeDocKey: docId }));
+      sendResponse({ ok: true, docId, docName, count: saved.library.length });
       return;
     }
 
     if (message?.type === "applyDocCitationsAndReferences") {
       try {
+        const libraryState = await loadLibraryState({ interactive: true });
         const docId = (message.docId || "").trim();
         if (!docId) throw new Error("Missing docId for Docs update.");
         const tokenReplacements = Array.isArray(message.tokenReplacements) ? message.tokenReplacements : [];
-        const scoped = (librariesByDoc?.[docId]?.library || library);
-        const result = await applyDocCitationsAndReferencesForLibrary({ docId, tokenReplacements, citationStyle, scopedLibrary: scoped });
+        const scoped = (libraryState.librariesByDoc?.[docId]?.library || libraryState.library);
+        const result = await applyDocCitationsAndReferencesForLibrary({ docId, tokenReplacements, citationStyle: libraryState.citationStyle, scopedLibrary: scoped });
         sendResponse(result);
       } catch (error) {
         sendResponse({ ok: false, error: error.message });
@@ -498,36 +710,46 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return;
     }
 
+    if (message?.type === "clearLibrary") {
+      const libraryState = await loadLibraryState({ interactive: true });
+      await saveLibraryState(normalizeLibraryState({ ...libraryState, library: [] }));
+      sendResponse({ ok: true });
+      return;
+    }
+
     if (message?.type === "mergeDuplicates") {
+      const libraryState = await loadLibraryState({ interactive: true });
       const seen = new Map();
       const merged = [];
-      for (const item of library) {
+      for (const item of libraryState.library) {
         const key = item.doi?.toLowerCase() || item.pmid || fingerprint(item);
         if (!seen.has(key)) {
           seen.set(key, item);
           merged.push(item);
         }
       }
-      await saveLibrary(merged);
-      sendResponse({ ok: true, removed: library.length - merged.length });
+      await saveLibraryState(normalizeLibraryState({ ...libraryState, library: merged }));
+      sendResponse({ ok: true, removed: libraryState.library.length - merged.length });
       return;
     }
+
     if (message?.type === "ingestTokensAndBuildCitations") {
+      const libraryState = await loadLibraryState({ interactive: true });
       const docKey = message.docId || "default-doc";
       const docName = message.docName || "Untitled Doc";
-      const scopedLibrary = librariesByDoc?.[docKey]?.library || library;
+      const scopedLibrary = libraryState.librariesByDoc?.[docKey]?.library || libraryState.library;
       let workingLibrary = [...scopedLibrary];
       let imported = 0;
       const failed = [];
       const replacements = [];
 
-      let incomingGroups = Array.isArray(message.groups) ? message.groups : [];
+      let incomingGroups = Array.isArray(message.groups) ? message.groups.map((group) => parseAllowedTokenGroup(group.rawToken) || group).filter((group) => group?.ids?.length) : [];
       let fallbackError = "";
       if (!incomingGroups.length) {
         const candidates = [];
         if (message.docId) candidates.push(message.docId);
         if (docKey && !candidates.includes(docKey)) candidates.push(docKey);
-        const linkedUrlId = parseDocIdFromUrl(librariesByDoc?.[docKey]?.url || "");
+        const linkedUrlId = parseDocIdFromUrl(libraryState.librariesByDoc?.[docKey]?.url || "");
         if (linkedUrlId && !candidates.includes(linkedUrlId)) candidates.push(linkedUrlId);
 
         let lastError = "";
@@ -545,39 +767,29 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       }
 
       for (const group of incomingGroups) {
-        const mode = (group.label || "").toLowerCase() === "pmid" ? "pmid" : "doi";
-        const ids = (group.ids || []).map((x) => normalizeIdentifier(mode === "pmid" ? String(x).replace(/^PMID:/i, "") : x)).filter(Boolean);
-        const citationIndexes = [];
-
-        for (const id of ids) {
-          try {
-            const result = await upsertIdentifier(mode, id, workingLibrary);
-            workingLibrary = result.library;
-            if (result.imported) imported += 1;
-            if (result.record) citationIndexes.push(workingLibrary.indexOf(result.record) + 1);
-          } catch (error) {
-            failed.push({ id, error: error.message });
-          }
-        }
-
-        const key = `${mode === "pmid" ? "PMID" : "DOI"}|${ids.join(";")}`;
-        replacements.push({ key, display: formatCitationField(citationIndexes), rawToken: group.rawToken || "" });
+        const processed = await buildReplacementForGroup(group, workingLibrary);
+        workingLibrary = processed.library;
+        imported += processed.imported;
+        failed.push(...processed.failed);
+        replacements.push(processed.replacement);
       }
 
-      await saveLibraryForDoc(docKey, docName, workingLibrary, librariesByDoc);
+      const updatedState = saveLibraryForDocState(libraryState, docKey, docName, workingLibrary);
+      await saveLibraryState(updatedState);
       sendResponse({ ok: true, replacements, imported, failed, docKey, docName, foundGroups: incomingGroups.length, fallbackError });
       return;
     }
 
     if (message?.type === "convertDocById") {
       try {
+        const libraryState = await loadLibraryState({ interactive: true });
         const docId = (message.docId || "").trim();
         if (!docId) throw new Error("Missing Google Doc ID.");
-        const built = await ingestAndBuildForDoc({ docId, docName: `Manual Doc ${docId.slice(0, 8)}...`, library, librariesByDoc });
-        const tokenReplacements = (built.replacements || []).filter((r) => r.rawToken).map((r) => ({ rawToken: r.rawToken, display: r.display }));
-        if (!built.foundGroups) throw new Error("No DOI/PMID token groups were found in this Google Doc.");
-        await applyDocCitationsAndReferencesForLibrary({ docId: built.docKey, tokenReplacements, citationStyle, scopedLibrary: built.workingLibrary });
-        sendResponse({ ok: true, replacedCount: tokenReplacements.length, imported: built.imported, failed: built.failed });
+        const built = await ingestAndBuildForDoc({ docId, docName: `Manual Doc ${docId.slice(0, 8)}...`, libraryState });
+        const tokenReplacements = (built.replacements || []).filter((r) => r.rawToken).map((r) => ({ rawToken: r.rawToken, display: r.display, urls: r.urls, title: r.title }));
+        if (!built.foundGroups) throw new Error("No valid DOI/PMID token groups were found in this Google Doc.");
+        const applied = await applyDocCitationsAndReferencesForLibrary({ docId: built.docKey, tokenReplacements, citationStyle: built.libraryState.citationStyle, scopedLibrary: built.workingLibrary });
+        sendResponse({ ok: true, replacedCount: tokenReplacements.length, imported: built.imported, failed: built.failed, applied });
       } catch (error) {
         const raw = error?.message || "Document conversion failed.";
         if (raw.includes("/docs/v1/documents/") && raw.includes("failed: 404")) {
@@ -589,8 +801,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       }
       return;
     }
-
-  })();
+  })().catch((error) => sendResponse({ ok: false, error: error.message || "Unexpected RefManager error." }));
 
   return true;
 });
