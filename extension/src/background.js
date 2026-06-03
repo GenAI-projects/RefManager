@@ -532,8 +532,12 @@ async function getAuthToken(interactive = false) {
   return token;
 }
 
+function googleApiBaseUrl(path) {
+  return String(path).startsWith("/docs/") ? "https://docs.googleapis.com" : "https://www.googleapis.com";
+}
+
 async function googleApi(path, token, method = "GET", body, headers = {}) {
-  const response = await fetch(`https://www.googleapis.com${path}`, {
+  const response = await fetch(`${googleApiBaseUrl(path)}${path}`, {
     method,
     headers: {
       Authorization: `Bearer ${token}`,
