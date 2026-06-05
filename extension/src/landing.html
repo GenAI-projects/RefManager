@@ -2,14 +2,16 @@
 <html><head><meta charset="UTF-8"/><title>RefManager Setup</title><link rel="stylesheet" href="styles.css"/></head>
 <body><main>
 <h1>RefManager: Google Workspace Setup</h1>
-<p>Sign in to Google and verify Drive permissions before using automatic sync.</p>
-<label>Google OAuth Client ID <input id="client-id" style="width:100%" placeholder="YOUR_CLIENT_ID.apps.googleusercontent.com"/></label>
+<p>Sign in to Google and verify Drive permissions before using automatic sync. Published builds can ship one publisher-managed OAuth client so users do not need to paste their own client ID.</p>
+<p id="packaged-client-id" class="muted"></p>
+<label>Google OAuth Client ID (optional local override) <input id="client-id" style="width:100%" placeholder="YOUR_CLIENT_ID.apps.googleusercontent.com"/></label>
 <p><strong>Authorized redirect URI to add in Google Cloud:</strong><br/><code id="redirect-uri"></code></p>
 <p><strong>Extension ID:</strong> <code id="extension-id"></code></p>
 <ul>
 <li>Create an <strong>OAuth 2.0 Client ID</strong> of type <strong>Web application</strong> in Google Cloud.</li>
 <li>Add the exact redirect URI shown above under that client.</li>
-<li>If you load this extension unpacked on another machine/profile, the extension ID can change, so that user must register their own redirect URI.</li>
+<li>For Chrome Web Store release, configure a single publisher-owned OAuth client for the fixed extension ID so users only consent to Google access and do not enter their own client ID.</li>
+<li>If you load this extension unpacked on another machine/profile, the extension ID can change, so that tester may need a local override client with the redirect URI shown above.</li>
 </ul>
 <div class="toolbar">
   <button id="save-client">Save Client ID</button>
