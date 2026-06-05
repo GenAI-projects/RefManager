@@ -85,7 +85,7 @@ Multiple entries are separated with semicolons, but every entry in one block mus
 - Invalid: `{DOI: 10.xxxx/one; https://doi.org/10.xxxx/two}`
 - Invalid: `{DOI: 10.xxxx/one; PMID: 12345}`
 
-Converted citations are inserted as editable superscript text and linked to the first paper URL in the citation group. For multi-reference groups, every paper URL is also written in the generated `References (RefManager)` section because a single Google Docs hyperlink can target only one URL.
+Converted citations are inserted as editable superscript text and, after the Docs API pass completes, are linked to the generated `References (RefManager)` heading instead of an external paper URL. Re-running conversion preserves existing bracketed citation displays when rebuilding the generated reference section, adds references for newly converted tokens, and highlights the generated reference context so clicking a citation navigates the user to the in-document references.
 
 ## OAuth client ownership after Chrome Web Store publication
 There are two viable OAuth ownership models. Choose one before publishing:
@@ -101,7 +101,7 @@ In this model:
 - Google API quota/accountability is associated with the publisher Google Cloud project, so publish with quotas, monitoring, and abuse controls in mind.
 - Workspace admins can allowlist the verified OAuth app and the Chrome extension ID for their domain.
 
-For a polished public release, replace the current pasted-client-ID setup with the Chrome extension OAuth manifest flow: add an `oauth2` manifest key containing the production Chrome Extension OAuth client ID and required scopes, then use Chrome Identity API token acquisition for that manifest-declared client. Keep the manual pasted-client-ID flow only for development builds or enterprise forks.
+For a polished public release, add an `oauth2` manifest key containing the production OAuth client ID and required scopes. RefManager now prefers a locally saved client ID for development overrides and otherwise falls back to a packaged manifest OAuth client ID, so Chrome Web Store users should only see the Google consent screen instead of being asked to paste their own client ID. Keep the manual pasted-client-ID flow only for development builds or enterprise forks.
 
 ### Option B: Bring-your-own OAuth client (best for private/enterprise/self-hosted users)
 If you do **not** want your Google Cloud project/client ID to be used by other organizations, keep the current setup-screen behavior and require each organization or individual to create and paste their own OAuth Client ID. This makes each adopter responsible for their own Google Cloud project, consent screen, verification/internal publishing, quotas, and Workspace allowlisting.
