@@ -506,21 +506,27 @@ function extractReferenceHeadingId(doc) {
   return "";
 }
 
+function createTextStyleRequest(startIndex, endIndex, textStyle, fields) {
+  if (!Number.isInteger(startIndex) || !Number.isInteger(endIndex) || endIndex <= startIndex) return null;
+  return {
+    updateTextStyle: {
+      range: { startIndex, endIndex },
+      textStyle,
+      fields
+    }
+  };
+}
+
 function buildReferenceContextStyleRequests(doc) {
   const markerRange = extractReferenceMarkerRange(doc);
   if (!markerRange) return [];
   const requests = [];
   for (const block of (doc?.body?.content || [])) {
     const startIndex = block.startIndex || 1;
-    const endIndex = block.endIndex || startIndex;
+    const endIndex = Math.max(startIndex, (block.endIndex || startIndex) - 1);
     if (startIndex <= markerRange.startIndex || endIndex <= markerRange.startIndex) continue;
-    requests.push({
-      updateTextStyle: {
-        range: { startIndex, endIndex: Math.max(startIndex, endIndex - 1) },
-        textStyle: docsTextStyleForReferenceContext(),
-        fields: docsTextStyleFieldsForReferenceContext()
-      }
-    });
+    const request = createTextStyleRequest(startIndex, endIndex, docsTextStyleForReferenceContext(), docsTextStyleFieldsForReferenceContext());
+    if (request) requests.push(request);
   }
   return requests;
 }
@@ -589,13 +595,8 @@ async function applyDocCitationsAndReferencesForLibrary({ docId, tokenReplacemen
         while (idx >= 0) {
           const startIndex = (el.startIndex || 1) + idx;
           const end = startIndex + citationText.length;
-          styleRequests.push({
-            updateTextStyle: {
-              range: { startIndex, endIndex: end },
-              textStyle: docsTextStyleForCitation(referenceHeadingId),
-              fields: docsTextStyleFieldsForCitation(referenceHeadingId)
-            }
-          });
+          const request = createTextStyleRequest(startIndex, end, docsTextStyleForCitation(referenceHeadingId), docsTextStyleFieldsForCitation(referenceHeadingId));
+          if (request) styleRequests.push(request);
           idx = content.indexOf(citationText, idx + citationText.length);
         }
       }
