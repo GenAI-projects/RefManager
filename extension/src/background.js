@@ -397,18 +397,39 @@ async function diagnoseDocAccess(docId) {
   }
 }
 
-function docsTextStyleForCitation(urls) {
-  const firstUrl = urls?.[0] || "";
+function docsTextStyleForCitation(referenceHeadingId = "") {
   return {
     baselineOffset: "SUPERSCRIPT",
-    ...(firstUrl ? { link: { url: firstUrl } } : {}),
+    ...(referenceHeadingId ? { link: { headingId: referenceHeadingId } } : {}),
     fontSize: { magnitude: 9, unit: "PT" },
     foregroundColor: { color: { rgbColor: { blue: 0.8, red: 0.06, green: 0.33 } } }
   };
 }
 
-function docsTextStyleFieldsForCitation(urls) {
-  return urls?.[0] ? "baselineOffset,link,fontSize,foregroundColor" : "baselineOffset,fontSize,foregroundColor";
+function docsTextStyleFieldsForCitation(referenceHeadingId = "") {
+  return referenceHeadingId ? "baselineOffset,link,fontSize,foregroundColor" : "baselineOffset,fontSize,foregroundColor";
+}
+
+function docsParagraphStyleRequest(range, namedStyleType) {
+  if (!range || !Number.isInteger(range.startIndex) || !Number.isInteger(range.endIndex) || range.endIndex <= range.startIndex) return null;
+  return {
+    updateParagraphStyle: {
+      range,
+      paragraphStyle: { namedStyleType },
+      fields: "namedStyleType"
+    }
+  };
+}
+
+function docsTextStyleForReferenceContext() {
+  return {
+    backgroundColor: { color: { rgbColor: { red: 1, green: 0.96, blue: 0.72 } } },
+    foregroundColor: { color: { rgbColor: { red: 0.16, green: 0.16, blue: 0.16 } } }
+  };
+}
+
+function docsTextStyleFieldsForReferenceContext() {
+  return "backgroundColor,foregroundColor";
 }
 
 function extractReferenceMarkerRange(doc) {
@@ -424,6 +445,19 @@ function extractReferenceMarkerRange(doc) {
         return { startIndex, endIndex: Math.max(startIndex + REFERENCES_MARKER.length, endIndex - 1) };
       }
       cursor = el.endIndex || cursor + content.length;
+    }
+  }
+  return null;
+}
+
+
+function extractReferenceMarkerParagraphRange(doc) {
+  for (const block of (doc?.body?.content || [])) {
+    const elements = block?.paragraph?.elements || [];
+    if (elements.some((el) => (el?.textRun?.content || "").includes(REFERENCES_MARKER))) {
+      const startIndex = block.startIndex || elements[0]?.startIndex || 1;
+      const endIndex = block.endIndex || elements[elements.length - 1]?.endIndex || startIndex + REFERENCES_MARKER.length;
+      return { startIndex, endIndex: Math.max(startIndex + 1, endIndex - 1) };
     }
   }
   return null;
@@ -446,8 +480,8 @@ function citationIndicesFromDisplay(display) {
   return value.split(",").map((n) => Number(n.trim())).filter((n) => Number.isInteger(n) && n > 0);
 }
 
-function buildReferencesText(tokenReplacements, scopedLibrary, citationStyle) {
-  const citedDisplays = new Set(tokenReplacements.map((r) => String(r.display || "")).filter(Boolean));
+function buildReferencesTextFromDisplays(citationDisplays, scopedLibrary, citationStyle) {
+  const citedDisplays = new Set(citationDisplays.map((display) => String(display || "")).filter(Boolean));
   const citedIndices = [...citedDisplays].flatMap(citationIndicesFromDisplay);
   const uniqueIndices = [...new Set(citedIndices)].sort((a, b) => a - b);
   const references = uniqueIndices.map((idx) => {
@@ -457,11 +491,85 @@ function buildReferencesText(tokenReplacements, scopedLibrary, citationStyle) {
   return references ? `\n\n${REFERENCES_MARKER}\n${references}\n` : "";
 }
 
+function collectCitationDisplaysBeforeReferences(doc, referenceRange = null) {
+  const displays = [];
+  const citationPattern = /\[(\d+(?:\s*(?:-|,)\s*\d+)*)\]/g;
+  const referenceStart = referenceRange?.startIndex || Number.POSITIVE_INFINITY;
+  for (const block of (doc?.body?.content || [])) {
+    for (const el of (block?.paragraph?.elements || [])) {
+      if ((el.startIndex || 1) >= referenceStart) continue;
+      const content = el?.textRun?.content || "";
+      citationPattern.lastIndex = 0;
+      let match;
+      while ((match = citationPattern.exec(content)) !== null) displays.push(match[1].replace(/\s+/g, ""));
+    }
+  }
+  return displays;
+}
+
+function collectReferenceBlocks(doc) {
+  const blocks = [];
+  const markerRange = extractReferenceMarkerRange(doc);
+  if (!markerRange) return blocks;
+  for (const block of (doc?.body?.content || [])) {
+    const paragraph = block?.paragraph;
+    if (!paragraph || (block.startIndex || 1) <= markerRange.startIndex) continue;
+    const content = (paragraph.elements || []).map((el) => el?.textRun?.content || "").join("");
+    const match = content.match(/^\s*(\d+)\.\s+/);
+    if (!match) continue;
+    const startIndex = block.startIndex || paragraph.elements?.[0]?.startIndex || 1;
+    const endIndex = Math.max(startIndex, (block.endIndex || startIndex) - 1);
+    blocks.push({
+      index: Number(match[1]),
+      range: { startIndex, endIndex },
+      headingId: paragraph.paragraphStyle?.headingId || ""
+    });
+  }
+  return blocks;
+}
+
+function extractReferenceMarkerHeadingId(doc) {
+  for (const block of (doc?.body?.content || [])) {
+    const elements = block?.paragraph?.elements || [];
+    if (elements.some((el) => (el?.textRun?.content || "").includes(REFERENCES_MARKER))) {
+      return block?.paragraph?.paragraphStyle?.headingId || "";
+    }
+  }
+  return "";
+}
+
+function referenceHeadingIdForDisplay(display, referenceBlocks, fallbackHeadingId = "") {
+  const firstIndex = citationIndicesFromDisplay(display)[0];
+  if (!firstIndex) return fallbackHeadingId;
+  return referenceBlocks.find((block) => block.index === firstIndex)?.headingId || fallbackHeadingId;
+}
+
+function createTextStyleRequest(startIndex, endIndex, textStyle, fields) {
+  if (!Number.isInteger(startIndex) || !Number.isInteger(endIndex) || endIndex <= startIndex) return null;
+  return {
+    updateTextStyle: {
+      range: { startIndex, endIndex },
+      textStyle,
+      fields
+    }
+  };
+}
+
+function buildReferenceContextStyleRequests(referenceBlocks) {
+  const requests = [];
+  for (const block of referenceBlocks) {
+    const request = createTextStyleRequest(block.range.startIndex, block.range.endIndex, docsTextStyleForReferenceContext(), docsTextStyleFieldsForReferenceContext());
+    if (request) requests.push(request);
+  }
+  return requests;
+}
+
 async function applyDocCitationsAndReferencesForLibrary({ docId, tokenReplacements, citationStyle, scopedLibrary }) {
   const token = await getAuthToken(true);
   let docMeta = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
 
   const existingReferenceRange = extractReferenceMarkerRange(docMeta);
+  const existingDisplays = collectCitationDisplaysBeforeReferences(docMeta, existingReferenceRange);
   if (existingReferenceRange) {
     await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}:batchUpdate`, token, "POST", {
       requests: [{ deleteContentRange: { range: existingReferenceRange } }]
@@ -483,7 +591,10 @@ async function applyDocCitationsAndReferencesForLibrary({ docId, tokenReplacemen
     docMeta = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
   }
 
-  const referencesText = buildReferencesText(tokenReplacements, scopedLibrary, citationStyle);
+  const currentDisplays = collectCitationDisplaysBeforeReferences(docMeta);
+  const replacementDisplays = tokenReplacements.map((r) => r.display);
+  const allDisplays = [...existingDisplays, ...currentDisplays, ...replacementDisplays];
+  const referencesText = buildReferencesTextFromDisplays(allDisplays, scopedLibrary, citationStyle);
   if (referencesText) {
     await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}:batchUpdate`, token, "POST", {
       requests: [{ insertText: { location: { index: docEndInsertIndex(docMeta) }, text: referencesText } }]
@@ -491,10 +602,25 @@ async function applyDocCitationsAndReferencesForLibrary({ docId, tokenReplacemen
     docMeta = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
   }
 
-  const styleRequests = [];
-  for (const r of tokenReplacements) {
-    if (!r.display) continue;
-    const citationText = `[${r.display}]`;
+  const paragraphStyleRequests = [];
+  const newReferenceRange = extractReferenceMarkerParagraphRange(docMeta);
+  const markerHeadingRequest = docsParagraphStyleRequest(newReferenceRange, "HEADING_2");
+  if (markerHeadingRequest) paragraphStyleRequests.push(markerHeadingRequest);
+  for (const block of collectReferenceBlocks(docMeta)) {
+    const referenceHeadingRequest = docsParagraphStyleRequest(block.range, "HEADING_6");
+    if (referenceHeadingRequest) paragraphStyleRequests.push(referenceHeadingRequest);
+  }
+  if (paragraphStyleRequests.length) {
+    await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}:batchUpdate`, token, "POST", { requests: paragraphStyleRequests });
+    docMeta = await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}`, token);
+  }
+
+  const referenceBlocks = collectReferenceBlocks(docMeta);
+  const fallbackHeadingId = extractReferenceMarkerHeadingId(docMeta);
+  const citedDisplays = [...new Set(allDisplays.map((display) => String(display || "").trim()).filter(Boolean))];
+  const styleRequests = [...buildReferenceContextStyleRequests(referenceBlocks)];
+  for (const display of citedDisplays) {
+    const citationText = `[${display}]`;
     for (const block of (docMeta?.body?.content || [])) {
       for (const el of (block?.paragraph?.elements || [])) {
         const content = el?.textRun?.content || "";
@@ -502,27 +628,33 @@ async function applyDocCitationsAndReferencesForLibrary({ docId, tokenReplacemen
         while (idx >= 0) {
           const startIndex = (el.startIndex || 1) + idx;
           const end = startIndex + citationText.length;
-          styleRequests.push({
-            updateTextStyle: {
-              range: { startIndex, endIndex: end },
-              textStyle: docsTextStyleForCitation(r.urls || []),
-              fields: docsTextStyleFieldsForCitation(r.urls || [])
-            }
-          });
+          const referenceHeadingId = referenceHeadingIdForDisplay(display, referenceBlocks, fallbackHeadingId);
+          const request = createTextStyleRequest(startIndex, end, docsTextStyleForCitation(referenceHeadingId), docsTextStyleFieldsForCitation(referenceHeadingId));
+          if (request) styleRequests.push(request);
           idx = content.indexOf(citationText, idx + citationText.length);
         }
       }
     }
   }
   if (styleRequests.length) await googleApi(`/docs/v1/documents/${encodeURIComponent(docId)}:batchUpdate`, token, "POST", { requests: styleRequests });
-  return { ok: true, replacedCount: replaceRequests.length, referencesInserted: Boolean(referencesText), styledCount: styleRequests.length };
+  return { ok: true, replacedCount: replaceRequests.length, referencesInserted: Boolean(referencesText), styledCount: styleRequests.length, linkedToReferences: referenceBlocks.some((block) => block.headingId) };
+}
+
+function getPackagedOAuthClientId() {
+  return chrome.runtime.getManifest?.()?.oauth2?.client_id || "";
+}
+
+async function getConfiguredOAuthClientId() {
+  const { oauthClientId = "" } = await chrome.storage.local.get(["oauthClientId"]);
+  return String(oauthClientId || getPackagedOAuthClientId()).trim();
 }
 
 async function getAuthToken(interactive = false) {
-  const { oauthAccessToken, oauthTokenExpiresAt = 0, oauthClientId = "" } = await chrome.storage.local.get(["oauthAccessToken", "oauthTokenExpiresAt", "oauthClientId"]);
+  const { oauthAccessToken, oauthTokenExpiresAt = 0 } = await chrome.storage.local.get(["oauthAccessToken", "oauthTokenExpiresAt"]);
+  const oauthClientId = await getConfiguredOAuthClientId();
   if (oauthAccessToken && Date.now() < oauthTokenExpiresAt - 60_000 && await tokenHasRequiredScopes(oauthAccessToken)) return oauthAccessToken;
   if (!interactive) throw new Error("Authentication required.");
-  if (!oauthClientId) throw new Error("Google OAuth Client ID is not configured. Set it on the landing page.");
+  if (!oauthClientId) throw new Error("Google OAuth Client ID is not configured. Add a packaged client ID for release or set one on the landing page for local testing.");
 
   const redirectUri = chrome.identity.getRedirectURL();
   const scopes = REQUIRED_SCOPES.join(" ");
@@ -801,7 +933,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         const docId = (message.docId || "").trim();
         if (!docId) throw new Error("Missing Google Doc ID.");
         const built = await ingestAndBuildForDoc({ docId, docName: `Manual Doc ${docId.slice(0, 8)}...`, libraryState });
-        const tokenReplacements = (built.replacements || []).filter((r) => r.rawToken).map((r) => ({ rawToken: r.rawToken, display: r.display, urls: r.urls, title: r.title }));
+        const tokenReplacements = (built.replacements || []).filter((r) => r.rawToken).map((r) => ({ rawToken: r.rawToken, display: r.display, urls: r.urls, title: r.title, ids: r.ids || [], label: r.label || "" }));
         if (!built.foundGroups) throw new Error("No valid DOI/PMID token groups were found in this Google Doc.");
         const applied = await applyDocCitationsAndReferencesForLibrary({ docId: built.docKey, tokenReplacements, citationStyle: built.libraryState.citationStyle, scopedLibrary: built.workingLibrary });
         sendResponse({ ok: true, replacedCount: tokenReplacements.length, imported: built.imported, failed: built.failed, applied });

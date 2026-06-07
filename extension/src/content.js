@@ -75,10 +75,10 @@ function createCitationLink(displayValue, replacement) {
   sup.contentEditable = "true";
   sup.dataset.refmanager = JSON.stringify({ displayValue, urls, ids: replacement.ids || [], label: replacement.label });
   anchor.textContent = `[${displayValue}]`;
-  anchor.href = urls[0] || "#";
-  anchor.title = replacement.title || urls.join("\n");
-  anchor.target = "_blank";
-  anchor.rel = "noopener noreferrer";
+  anchor.href = "#refmanager-references";
+  anchor.title = replacement.title ? `${replacement.title}
+
+RefManager will link this citation to the generated References section in Google Docs.` : "RefManager citation: linked to the generated References section.";
   sup.appendChild(anchor);
   return sup;
 }
@@ -120,11 +120,11 @@ function convertDocTokensWithAutoLookup(sendResponse) {
     chrome.runtime.sendMessage({ type: "ingestTokensAndBuildCitations", groups: collectTokenGroups(), ...getDocContext() }, (response) => {
       if (chrome.runtime.lastError) return sendResponse({ ok: false, error: chrome.runtime.lastError.message });
       if (!response?.ok) return sendResponse({ ok: false, error: response?.error || "Failed to ingest tokens." });
-      const replacements = new Map((response.replacements || []).map((r) => [r.key, { display: r.display, urls: r.urls || [], title: r.title || "" }]));
+      const replacements = new Map((response.replacements || []).map((r) => [r.key, { display: r.display, urls: r.urls || [], title: r.title || "", ids: r.ids || [], label: r.label || "" }]));
       const replacedCount = processEditableRoots(replacements);
       const tokenReplacements = (response.replacements || [])
         .filter((r) => r.rawToken && r.display)
-        .map((r) => ({ rawToken: r.rawToken, display: r.display, urls: r.urls || [], title: r.title || "" }));
+        .map((r) => ({ rawToken: r.rawToken, display: r.display, urls: r.urls || [], title: r.title || "", ids: r.ids || [], label: r.label || "" }));
       chrome.runtime.sendMessage({ type: "applyDocCitationsAndReferences", docId: response?.docKey || getDocContext().docId, tokenReplacements }, (applyResponse) => {
         if (chrome.runtime.lastError) return sendResponse({ ok: false, error: chrome.runtime.lastError.message });
         if (!applyResponse?.ok) return sendResponse({ ok: false, error: applyResponse?.error || "Failed to update Google Doc." });

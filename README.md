@@ -1,119 +1,101 @@
 # RefManager
 
-Google-first reference manager extension prototype for thesis workflows.
+RefManager is a Chrome extension for turning DOI/PMID tokens in Google Docs into numbered in-document citations and a generated reference list.
 
-## Implemented now
-- DOI + PMID capture and metadata ingestion (Crossref + PubMed).
-- Local reference library manager with duplicate merge.
-- Citation style preview engine (APA/MLA/Vancouver).
-- Google Docs token conversion via popup command or in-doc button:
-  - `{10.xxxx/...; 10.xxxx/...}`
-  - `{PMID:12345; PMID:67890}`
+## Current behavior
 
-## Google Docs behavior and export reality
-- Google Docs does **not** expose true citation-field APIs to Chrome extensions.
-- RefManager inserts non-editable citation spans in the live editing surface.
-- When exporting to `.docx`/`.pdf`, Google Docs may flatten these to plain text (expected); structured metadata is not guaranteed.
+- Imports DOI metadata from Crossref and PMID metadata from NCBI PubMed.
+- Stores the user's library in their own Google Drive `appDataFolder` as `refmanager-library.json`.
+- Converts valid Google Docs tokens into bracketed superscript citations.
+- Adds or rebuilds a `References (RefManager)` section at the bottom of the Doc.
+- Links each converted citation to the first matching generated reference paragraph. For example, `[1-4]` targets reference `1`, while the generated reference entries for `1`, `2`, `3`, and `4` are included/highlighted in the reference section.
+- Re-running conversion after adding new tokens preserves existing bracketed citation displays and adds the new references to the generated section.
 
-## Local test steps
-1. Open `chrome://extensions`
-2. Enable Developer mode
-3. Load unpacked -> choose `extension/`
-4. In Google Docs, type tokens and click **Convert tokens in current Google Doc** from extension popup.
-
-## Next architecture for Google ecosystem excellence
-- Drive-backed library sync (shared JSON/CSL/Bib/RIS + conflict resolution)
-- Team shared libraries with permissions
-- PDF DOI extraction pipeline with Drive ingestion hooks
-
-## Google OAuth setup (redirect_uri_mismatch fix)
-When you click **Login to Google**, the extension uses `chrome.identity.launchWebAuthFlow` with this runtime redirect URI:
-
-`chrome.identity.getRedirectURL()`
-
-For unpacked installs this is tied to the current extension ID. To avoid `Error 400: redirect_uri_mismatch`:
-
-1. In Google Cloud Console, create an OAuth client of type **Web application**.
-2. In that client, add the exact redirect URI shown on the extension setup screen.
-3. Paste that client ID into RefManager setup and click **Save Client ID**.
-4. If the extension ID changes (different Chrome profile/machine, or reloaded without a stable key), the redirect URI changes too—update the OAuth client accordingly.
-
-## How auth and Drive access currently work
-- Login is user-consent based and stores a short-lived Google access token locally in the extension storage.
-- Sync writes to the signed-in user's Google Drive `appDataFolder` (private app data area) and can create temporary test files for permission checks.
-- API quotas and Drive limits are charged to the Google Cloud project tied to the OAuth client ID, while the file operations run against each signed-in user's own Drive account.
-
-## Server model clarification
-Current code is browser-only (no backend server required for normal usage):
-- DOI/PMID metadata fetch: directly from the extension to Crossref and NCBI.
-- Google Drive sync: directly from the extension to Google APIs with the user's token.
-
-If you later add a server, use it for optional features (e.g., team indexing, analytics, conflict orchestration), but avoid sending raw Google access tokens to your own backend unless you redesign auth for a secure server-side OAuth flow.
-
-## Google Workspace verification and production setup
-To make RefManager suitable for Google OAuth verification and Workspace use:
-
-1. **Publish from a stable extension identity.** Register the extension in the Chrome Web Store Developer Dashboard before submitting OAuth verification. A published or consistently packaged extension gives you a stable extension ID, which makes the `https://<extension-id>.chromiumapp.org/` redirect URL stable.
-2. **Create one production Google Cloud project.** Enable the Google Drive API and Google Docs API in that project.
-3. **Configure OAuth consent.** Use an external user type for public distribution or internal user type if the app is only for one Workspace domain. Add the app name, support email, app logo, authorized domain, homepage URL, privacy policy URL, and support/contact URL.
-4. **Use the minimum scopes currently required by the extension:**
-   - `https://www.googleapis.com/auth/drive.appdata` stores the RefManager library JSON in the user's private Drive app data folder.
-   - `https://www.googleapis.com/auth/drive.file` lets the app access files it creates or files the user opens/authorizes.
-   - `https://www.googleapis.com/auth/drive.metadata.readonly` checks linked Google Doc metadata and permissions.
-   - `https://www.googleapis.com/auth/documents` reads and updates token text and reference sections in Google Docs.
-   - `https://www.googleapis.com/auth/userinfo.email` shows the signed-in account during permission checks.
-5. **Add the extension redirect URI.** In the OAuth client, add the exact redirect URI shown on the RefManager setup screen. It is generated by `chrome.identity.getRedirectURL()` and follows the Chrome extension redirect pattern.
-6. **Prepare verification evidence.** Record a demo video showing login, Drive permission check, token conversion, Drive-backed library persistence, and Google Docs citation/reference insertion. The demo must visibly exercise every requested scope.
-7. **Submit OAuth verification.** In Google Cloud Console, submit the OAuth consent screen for verification with scope justifications, the demo video, and links to the homepage and privacy policy.
-8. **Workspace admin rollout.** If deploying inside a Workspace tenant, ask the admin to allowlist the verified OAuth app and the Chrome extension ID in the Admin console.
-
-## Drive-backed library behavior
-RefManager now treats Google Drive `appDataFolder` as the source of truth for the library. The file is named `refmanager-library.json`. The extension may keep a local cache so the UI can render quickly, but add/import/merge/style/link operations write back to Drive after authentication. The older `refmanager-shared-library.json` sync file is only used as a legacy import source during pull.
+Google Docs does not expose a true citation-field API to Chrome extensions, so exported `.docx`/`.pdf` files may flatten RefManager citations into styled text.
 
 ## Supported token syntax
-Only these token block styles are valid:
 
-- DOI prefix style: `{DOI: 10.xxxx/...}`
-- DOI URL style: `{https://doi.org/10.xxxx/...}`
-- PMID prefix style: `{PMID: 12345678}`
+Use one style per token block:
 
-Multiple entries are separated with semicolons, but every entry in one block must use the same style:
+```text
+{DOI: 10.xxxx/one}
+{DOI: 10.xxxx/one; DOI: 10.xxxx/two}
+{https://doi.org/10.xxxx/one; https://doi.org/10.xxxx/two}
+{PMID: 12345; PMID: 67890}
+```
 
-- Valid: `{DOI: 10.xxxx/one; DOI: 10.xxxx/two}`
-- Valid: `{https://doi.org/10.xxxx/one; https://doi.org/10.xxxx/two}`
-- Valid: `{PMID: 12345; PMID: 67890}`
-- Invalid: `{DOI: 10.xxxx/one; https://doi.org/10.xxxx/two}`
-- Invalid: `{DOI: 10.xxxx/one; PMID: 12345}`
+Do not mix DOI and PMID, or DOI-prefix and DOI-URL styles, inside the same block.
 
-Converted citations are inserted as editable superscript text and linked to the first paper URL in the citation group. For multi-reference groups, every paper URL is also written in the generated `References (RefManager)` section because a single Google Docs hyperlink can target only one URL.
+## Local development
 
-## OAuth client ownership after Chrome Web Store publication
-There are two viable OAuth ownership models. Choose one before publishing:
+1. Open `chrome://extensions`.
+2. Enable **Developer mode**.
+3. Click **Load unpacked** and choose `extension/`.
+4. Open the RefManager setup page.
+5. Add a Google OAuth client ID for local testing if the build does not include a packaged OAuth client.
+6. Open a Google Doc, add valid tokens, then use the extension popup to link the Doc and click **Convert Tokens**.
 
-### Option A: Publisher-owned verified OAuth client (recommended for a normal public extension)
-A Chrome Web Store extension normally ships with one OAuth client ID for the application. The client ID identifies RefManager to Google; it is not a password or shared Drive credential. Every user still signs in with their own Google account, grants consent to the verified app, receives their own short-lived access token, and stores `refmanager-library.json` in their own private Drive `appDataFolder`.
+For unpacked builds, `chrome.identity.getRedirectURL()` depends on the local extension ID. If the extension ID changes, update the redirect URI in the local OAuth client.
 
-In this model:
+## Production OAuth model
 
-- Your OAuth client/project is the app identity that appears on the consent screen.
-- Users do **not** get access to your Drive, your tokens, or your library.
-- Users' libraries are stored under each user's Drive account, not under the publisher's Drive account.
-- Google API quota/accountability is associated with the publisher Google Cloud project, so publish with quotas, monitoring, and abuse controls in mind.
-- Workspace admins can allowlist the verified OAuth app and the Chrome extension ID for their domain.
+For Chrome Web Store release, use one RefManager-owned OAuth client instead of asking every user to paste their own client ID.
 
-For a polished public release, replace the current pasted-client-ID setup with the Chrome extension OAuth manifest flow: add an `oauth2` manifest key containing the production Chrome Extension OAuth client ID and required scopes, then use Chrome Identity API token acquisition for that manifest-declared client. Keep the manual pasted-client-ID flow only for development builds or enterprise forks.
+Recommended setup:
 
-### Option B: Bring-your-own OAuth client (best for private/enterprise/self-hosted users)
-If you do **not** want your Google Cloud project/client ID to be used by other organizations, keep the current setup-screen behavior and require each organization or individual to create and paste their own OAuth Client ID. This makes each adopter responsible for their own Google Cloud project, consent screen, verification/internal publishing, quotas, and Workspace allowlisting.
+1. Create a production Google Cloud project for RefManager.
+2. Enable the Google Drive API and Google Docs API.
+3. Configure the OAuth consent screen with the RefManager name, logo, support email, homepage, and privacy policy.
+4. Create an OAuth client for the Chrome extension / web auth flow and add the extension redirect URI shown by the setup page.
+5. Add the production client ID to the extension manifest `oauth2.client_id` for release builds.
+6. Keep the setup-page client ID field only as an advanced local override for development or enterprise forks.
+7. Submit the OAuth app for verification if Google requires review for the requested scopes.
 
-In this model:
+Required scopes today:
 
-- RefManager code is shared, but every adopter supplies their own OAuth app identity.
-- The adopter's OAuth client appears on the consent screen.
-- The adopter's Google Cloud project owns API quota and app verification responsibility.
-- This is less convenient for public Chrome Web Store users because they must complete Google Cloud setup before login.
+- `https://www.googleapis.com/auth/drive.appdata` — private library storage.
+- `https://www.googleapis.com/auth/drive.file` — file access/permission checks for Docs the user authorizes.
+- `https://www.googleapis.com/auth/drive.metadata.readonly` — linked Doc metadata checks.
+- `https://www.googleapis.com/auth/documents` — read/update token text and generated references.
+- `https://www.googleapis.com/auth/userinfo.email` — display/check the signed-in account.
 
-### How another user experiences the app
-If you publish with Option A, a new user installs RefManager from the Chrome Web Store, clicks **Login to Google**, sees your verified RefManager consent screen, grants access, runs the Drive permission check, and then converts tokens in their Google Docs. The extension reads/writes only that user's authorized Google Docs and stores that user's library file in that user's Drive `appDataFolder`.
+## Cost, quota, and limits
 
-If you publish with Option B, a new user installs the extension but must first create/configure their own Google Cloud OAuth client, paste that client ID into RefManager setup, and then sign in. Their own OAuth app identity is used instead of yours.
+- Users sign in with their own Google accounts. Their Docs, Drive files, tokens, and libraries remain under their own Google account, not yours.
+- The RefManager Google Cloud project owns API quota/accountability for Drive and Docs requests made through the packaged OAuth client.
+- Google API usage is normally quota-limited by project/API. Monitor usage in Google Cloud Console under **APIs & Services** and **Quotas & System Limits**.
+- If many users convert large Docs frequently, you may hit per-minute or per-day API quotas. Request quota increases from Google Cloud if needed.
+- Drive/Docs API calls used here are usually free within Google Cloud's normal API quota model, but you should still monitor billing/quota pages before public launch.
+- Crossref and NCBI are external free metadata services with their own fair-use/rate-limit expectations; add caching and polite request headers before scaling widely.
+- Chrome Web Store publishing requires a developer account and a one-time registration fee according to the Chrome Web Store registration docs.
+
+Official docs to keep handy:
+
+- Chrome Web Store publishing: https://developer.chrome.com/docs/webstore/publish
+- Chrome Web Store developer registration: https://developer.chrome.com/docs/webstore/register
+- Chrome Identity API: https://developer.chrome.com/docs/extensions/reference/api/identity
+- Google Cloud quota management: https://docs.cloud.google.com/docs/quotas/view-manage
+- Google OAuth verification: https://developers.google.com/identity/protocols/oauth2/production-readiness
+
+## Chrome Web Store publishing checklist
+
+1. Finalize the extension name, description, icons, screenshots, and privacy policy.
+2. Remove development-only wording from the public UI.
+3. Package only the `extension/` directory as a zip.
+4. Register/sign in to the Chrome Web Store Developer Dashboard.
+5. Upload the zip as a new item.
+6. Complete Store Listing, Privacy, Distribution, and Test Instructions.
+7. Explain the single purpose clearly: converting DOI/PMID tokens into Google Docs citations/references.
+8. Declare Google Docs/Drive data usage accurately.
+9. Include test instructions for reviewers: login, link a Doc, convert sample tokens, inspect generated references.
+10. Submit for review, preferably with deferred publishing enabled until OAuth verification and store review both pass.
+
+## UI direction
+
+A cleaner production UI should separate daily use from setup:
+
+- **Popup:** show only linked Doc status, **Convert Tokens**, last conversion result, and a small **Library** link.
+- **Setup page:** show sign-in status, permission check, privacy link, and an **Advanced** section for OAuth override. Hide saved OAuth client IDs by default.
+- **Options/library page:** show references, citation style, sync status, duplicate merge, and export/import actions.
+- **Conversion result:** report imported count, failed DOI/PMID lookups, citations converted, and whether citations were linked to reference paragraphs.
+- **Errors:** translate OAuth/Docs API errors into actionable messages such as “wrong Google account,” “Doc not shared,” or “OAuth redirect URI mismatch.”
